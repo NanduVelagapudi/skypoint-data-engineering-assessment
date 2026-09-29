@@ -1,0 +1,125 @@
+{
+  "network": "Northwind Health (synthetic)",
+  "source_systems": [
+    {
+      "source_system": "EPIC_NORTH",
+      "vendor": "Epic",
+      "file_name": "encounters_epic_north.csv",
+      "date_order": "MDY",
+      "amount_unit": "USD",
+      "timestamp_timezone": "UTC",
+      "mrn_scope": "shared across all EPIC_NORTH facilities",
+      "notes": "Numeric dates are month-first."
+    },
+    {
+      "source_system": "LEGACY_MEDITECH",
+      "vendor": "Meditech",
+      "file_name": "encounters_legacy_meditech.csv",
+      "date_order": "DMY",
+      "amount_unit": "USD_CENTS",
+      "timestamp_timezone": "America/Chicago",
+      "mrn_scope": "shared across all LEGACY_MEDITECH facilities",
+      "notes": "billed_amount is an integer number of US cents. Numeric dates are day-first. last_updated_ts is local wall-clock time without an offset."
+    },
+    {
+      "source_system": "ATHENA_CLINICS",
+      "vendor": "athenahealth",
+      "file_name": "encounters_athena_clinics.csv",
+      "date_order": "MDY",
+      "amount_unit": "USD",
+      "timestamp_timezone": "UTC",
+      "mrn_scope": "shared across all ATHENA_CLINICS practices",
+      "notes": "Numeric dates are month-first; two-digit years mean 20xx. last_updated_ts is UTC."
+    }
+  ],
+  "facilities": [
+    {
+      "facility_id": "FAC001",
+      "facility_name": "Lakeshore General Hospital",
+      "source_system": "EPIC_NORTH",
+      "facility_type": "Acute Care Hospital",
+      "city": "Milwaukee",
+      "state": "WI",
+      "bed_count": 320,
+      "ownership": "Owned",
+      "go_live_date": "2021-06-01"
+    },
+    {
+      "facility_id": "FAC002",
+      "facility_name": "St. Brendan Medical Center",
+      "source_system": "EPIC_NORTH",
+      "facility_type": "Acute Care Hospital",
+      "city": "Madison",
+      "state": "WI",
+      "bed_count": 210,
+      "ownership": "Owned",
+      "go_live_date": "2021-06-01"
+    },
+    {
+      "facility_id": "FAC003",
+      "facility_name": "Maple Grove Pediatrics",
+      "source_system": "EPIC_NORTH",
+      "facility_type": "Clinic",
+      "city": "Waukesha",
+      "state": "WI",
+      "bed_count": 0,
+      "ownership": "Owned",
+      "go_live_date": "2022-01-15"
+    },
+    {
+      "facility_id": "FAC004",
+      "facility_name": "Riverbend Community Hospital",
+      "source_system": "LEGACY_MEDITECH",
+      "facility_type": "Critical Access Hospital",
+      "city": "Dubuque",
+      "state": "IA",
+      "bed_count": 25,
+      "ownership": "Affiliated",
+      "go_live_date": "2024-03-01"
+    },
+    {
+      "facility_id": "FAC005",
+      "facility_name": "Harbor Point Behavioral Health",
+      "source_system": "LEGACY_MEDITECH",
+      "facility_type": "Behavioral Health Hospital",
+      "city": "Rockford",
+      "state": "IL",
+      "bed_count": 60,
+      "ownership": "Affiliated",
+      "go_live_date": "2022-09-01"
+    },
+    {
+      "facility_id": "FAC006",
+      "facility_name": "Cedar Valley Family Clinic",
+      "source_system": "ATHENA_CLINICS",
+      "facility_type": "Clinic",
+      "city": "Cedar Rapids",
+      "state": "IA",
+      "bed_count": 0,
+      "ownership": "Owned",
+      "go_live_date": "2020-11-01"
+    },
+    {
+      "facility_id": "FAC007",
+      "facility_name": "Eastgate Urgent Care",
+      "source_system": "ATHENA_CLINICS",
+      "facility_type": "Urgent Care",
+      "city": "Kenosha",
+      "state": "WI",
+      "bed_count": 0,
+      "ownership": "Owned",
+      "go_live_date": "2020-11-01"
+    },
+    {
+      "facility_id": "FAC008",
+      "facility_name": "Summit Ridge Orthopedics",
+      "source_system": "ATHENA_CLINICS",
+      "facility_type": "Specialty Clinic",
+      "city": "Green Bay",
+      "state": "WI",
+      "bed_count": 0,
+      "ownership": "Affiliated",
+      "go_live_date": "2023-02-01"
+    }
+  ]
+}

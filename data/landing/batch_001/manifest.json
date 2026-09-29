@@ -1,0 +1,24 @@
+{
+  "batch_id": "batch_001",
+  "delivered_at": "2025-01-06T06:00:00Z",
+  "files": [
+    {
+      "file_name": "encounters_epic_north.csv",
+      "source_system": "EPIC_NORTH",
+      "row_count": 1432,
+      "sha256": "95d5116a284f7e439972e418e8ccfa35b03fd15a558a3457d323ebce6e31af58"
+    },
+    {
+      "file_name": "encounters_legacy_meditech.csv",
+      "source_system": "LEGACY_MEDITECH",
+      "row_count": 341,
+      "sha256": "37d089c10c3ab1aefdc79b0aa6644c0feb93dd5fdff920dabd1fc16ff6d3df99"
+    },
+    {
+      "file_name": "encounters_athena_clinics.csv",
+      "source_system": "ATHENA_CLINICS",
+      "row_count": 1090,
+      "sha256": "1ccac9c60521e1f37db412fe62ecd8f0ea327341a40eedd4e01c9bb33256ed36"
+    }
+  ]
+}

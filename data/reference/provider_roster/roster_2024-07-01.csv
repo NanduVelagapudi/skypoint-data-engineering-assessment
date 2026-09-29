@@ -1,0 +1,52 @@
+as_of_date,npi,provider_last_name,provider_first_name,credential,specialty,primary_facility_id,employment_status
+2024-07-01,1538453550,Martinez,Carlos,NP,Psychiatry,FAC005,Affiliated
+2024-07-01,1472671472,Olson,Mei,PA,Cardiology,FAC001,Employed
+2024-07-01,1787680457,Moore,Lisa,NP,Cardiology,FAC001,Affiliated
+2024-07-01,1228088641,Patel,Jessica,MD,Emergency Medicine,FAC004,Employed
+2024-07-01,1410646008,Hernandez,Matthew,DO,Pediatrics,FAC003,Employed
+2024-07-01,1778486484,Thomas,Emily,MD,Internal Medicine,FAC001,Employed
+2024-07-01,1860320807,Schultz,Rebecca,MD,Emergency Medicine,FAC001,Employed
+2024-07-01,1771884131,Thompson,Karen,PA,Internal Medicine,FAC002,Employed
+2024-07-01,1849518380,Wright,Mary,MD,Orthopedic Surgery,FAC008,Affiliated
+2024-07-01,1642524775,Hall,Sarah,MD,Internal Medicine,FAC002,Employed
+2024-07-01,1443256882,Garcia,Michael,NP,Endocrinology,FAC006,Employed
+2024-07-01,1062048420,White,Paul,MD,Orthopedic Surgery,FAC008,Affiliated
+2024-07-01,1188357952,Nguyen,Katherine,NP,Internal Medicine,FAC006,Employed
+2024-07-01,1129110288,Jensen,Susan,MD,Hospitalist,FAC002,Affiliated
+2024-07-01,1541465906,Johnson,Samuel,DO,Pediatrics,FAC003,Employed
+2024-07-01,1018051544,Martinez,Richard,MD,Family Medicine,FAC006,Employed
+2024-07-01,1472855687,Schmidt,Joseph,MD,Orthopedic Surgery,FAC008,Affiliated
+2024-07-01,1536455680,Kowalski,Noah,MD,Hospitalist,FAC001,Affiliated
+2024-07-01,1895579906,Davis,Thomas,MD,Pediatrics,FAC003,Employed
+2024-07-01,1452059979,Williams,Thomas,PA,Nephrology,FAC001,Employed
+2024-07-01,1984162291,Hansen,Brian,MD,Endocrinology,FAC001,Employed
+2024-07-01,1440029787,Young,Olivia,MD,Internal Medicine,FAC001,Employed
+2024-07-01,1836016109,Schmidt,Michelle,MD,Hospitalist,FAC002,Employed
+2024-07-01,1028382228,Wilson,Chloe,NP,Emergency Medicine,FAC002,Employed
+2024-07-01,1552182481,Kowalski,Nancy,MD,Hospitalist,FAC001,Employed
+2024-07-01,1447294053,Peterson,Samuel,PA,Emergency Medicine,FAC001,Employed
+2024-07-01,1739241960,Thomas,William,MD,Orthopedic Surgery,FAC008,Employed
+2024-07-01,1585003704,Schmidt,Luis,DO,Internal Medicine,FAC004,Affiliated
+2024-07-01,1432627051,Nguyen,Katherine,PA,Psychiatry,FAC005,Affiliated
+2024-07-01,1652373550,Jensen,Nancy,NP,Emergency Medicine,FAC007,Affiliated
+2024-07-01,1701079810,Hall,Linda,MD,Pulmonology,FAC001,Employed
+2024-07-01,1682052588,Wright,James,DO,Cardiology,FAC002,Affiliated
+2024-07-01,1939494823,Jackson,William,PA,Pulmonology,FAC002,Employed
+2024-07-01,1215711643,Garcia-Lopez,Brian,MD,Family Medicine,FAC007,Employed
+2024-07-01,1309114175,King,Hannah,MD,Hospitalist,FAC001,Employed
+2024-07-01,1229836956,Nelson,Joshua,PA,Emergency Medicine,FAC002,Affiliated
+2024-07-01,1284352816,King,Sarah,DO,Family Medicine,FAC007,Affiliated
+2024-07-01,1309765828,Rodriguez,Maria,NP,Family Medicine,FAC006,Employed
+2024-07-01,1458421082,Lopez,Olivia,MD,Psychiatry,FAC005,Employed
+2024-07-01,1279264513,Lewis,Sofia,MD,Emergency Medicine,FAC007,Affiliated
+2024-07-01,1406925663,Mueller,Rebecca,MD,Hospitalist,FAC004,Affiliated
+2024-07-01,1844093249,Lewis,Michael,DO,Family Medicine,FAC006,Employed
+2024-07-01,1775003142,Hall,Laura,MD,Orthopedic Surgery,FAC008,Employed
+2024-07-01,1871689760,Walker,Ashley,PA,Emergency Medicine,FAC001,Employed
+2024-07-01,1906688282,Hansen,Ethan,DO,Psychiatry,FAC005,Affiliated
+2024-07-01,1139986982,Schmidt,Anthony,MD,Hospitalist,FAC001,Employed
+2024-07-01,1608565176,Van Dyke,Karen,NP,Family Medicine,FAC007,Employed
+2024-07-01,1105218543,Young,Tyler,MD,Nephrology,FAC002,Employed
+2024-07-01,1764529123,Jackson,Thomas,PA,Emergency Medicine,FAC004,Employed
+2024-07-01,1008754750,Hoffman,Katherine,MD,Hospitalist,FAC002,Employed
+2024-07-01,1930733682,Van Dyke,Linda,MD,Emergency Medicine,FAC004,Affiliated

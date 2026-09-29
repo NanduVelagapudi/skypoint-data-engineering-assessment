@@ -1,0 +1,44 @@
+icd10_code,description,category,is_chronic
+E11.9,Type 2 diabetes mellitus without complications,DIABETES,Y
+E11.65,Type 2 diabetes mellitus with hyperglycemia,DIABETES,Y
+E11.22,Type 2 diabetes mellitus with diabetic chronic kidney disease,DIABETES,Y
+E10.9,Type 1 diabetes mellitus without complications,DIABETES,Y
+I10,Essential (primary) hypertension,HYPERTENSION,Y
+I50.9,"Heart failure, unspecified",HEART_FAILURE,Y
+I50.22,Chronic systolic (congestive) heart failure,HEART_FAILURE,Y
+I50.32,Chronic diastolic (congestive) heart failure,HEART_FAILURE,Y
+J44.9,"Chronic obstructive pulmonary disease, unspecified",COPD,Y
+J44.1,Chronic obstructive pulmonary disease with (acute) exacerbation,COPD,Y
+N18.4,"Chronic kidney disease, stage 4 (severe)",CKD,Y
+N18.6,End stage renal disease,CKD,Y
+J45.909,"Unspecified asthma, uncomplicated",ASTHMA,Y
+J45.901,Unspecified asthma with (acute) exacerbation,ASTHMA,Y
+F32.9,"Major depressive disorder, single episode, unspecified",BEHAVIORAL_HEALTH,N
+F33.1,"Major depressive disorder, recurrent, moderate",BEHAVIORAL_HEALTH,N
+F41.1,Generalized anxiety disorder,BEHAVIORAL_HEALTH,N
+F31.9,"Bipolar disorder, unspecified",BEHAVIORAL_HEALTH,N
+F43.10,"Post-traumatic stress disorder, unspecified",BEHAVIORAL_HEALTH,N
+I21.9,"Acute myocardial infarction, unspecified",CARDIAC_ACUTE,N
+I48.91,Unspecified atrial fibrillation,CARDIAC_ACUTE,N
+I63.9,"Cerebral infarction, unspecified",STROKE,N
+J18.9,"Pneumonia, unspecified organism",INFECTION,N
+A41.9,"Sepsis, unspecified organism",INFECTION,N
+N39.0,"Urinary tract infection, site not specified",INFECTION,N
+J06.9,"Acute upper respiratory infection, unspecified",INFECTION,N
+J02.9,"Acute pharyngitis, unspecified",INFECTION,N
+U07.1,COVID-19,INFECTION,N
+N17.9,"Acute kidney failure, unspecified",RENAL_ACUTE,N
+R07.9,"Chest pain, unspecified",SYMPTOM,N
+R10.9,Unspecified abdominal pain,SYMPTOM,N
+R51.9,"Headache, unspecified",SYMPTOM,N
+R50.9,"Fever, unspecified",SYMPTOM,N
+S52.501A,"Unspecified fracture of the lower end of right radius, initial encounter for closed fracture",INJURY,N
+S93.401A,"Sprain of unspecified ligament of right ankle, initial encounter",INJURY,N
+S06.0X0A,"Concussion without loss of consciousness, initial encounter",INJURY,N
+M17.11,"Unilateral primary osteoarthritis, right knee",MUSCULOSKELETAL,N
+M17.0,Bilateral primary osteoarthritis of knee,MUSCULOSKELETAL,N
+M54.50,"Low back pain, unspecified",MUSCULOSKELETAL,N
+M25.561,Pain in right knee,MUSCULOSKELETAL,N
+Z00.00,Encounter for general adult medical examination without abnormal findings,PREVENTIVE,N
+Z00.129,Encounter for routine child health examination without abnormal findings,PREVENTIVE,N
+Z23,Encounter for immunization,PREVENTIVE,N
