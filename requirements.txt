@@ -1,0 +1,3 @@
+duckdb==1.3.2
+pytest==8.4.1
+tzdata==2025.2
