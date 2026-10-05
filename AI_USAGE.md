@@ -72,3 +72,26 @@
 
 ### Corrections
 - Its first `parse_date` would have quietly read a naive `delivered_at` as machine-local time. It caught this in its own review before running tests, and the function now raises.
+
+## Task 2 parsers (D2): categorical fields, ICD-10, NPI
+
+### Where it saved time
+- Checked my D2 prompt against the brief. The prompt said the assessment lists source spellings such as `ED / ER / Emergency Room`. Claude Code searched the PDF text and confirmed the PDF contains no images, then reported that the brief lists only the target categories. The spelling mappings are therefore recorded as my decisions in DECISIONS.md.
+- Profiled batches 001–003 before writing code. Categorical labels were listed with exact counts; diagnosis codes and NPIs only as masked shapes and aggregate counts. This found:
+  - 13 encounter-type spellings (about 2,000 rows) that my prompt's mapping list did not cover;
+  - that the data writes `Closed - Paid`, not `Closed-Paid`;
+  - 14 numeric ICD-9 codes, all in Meditech;
+  - 80 Athena NPIs with a trailing `.0`.
+- Ran the finished parsers over all 3,636 accepted rows and reported counts only. Every count matched the profile, and no value was unmapped.
+- Checked the NPI check digit against the CMS worked example, and in the tests against an independently written Luhn function.
+
+### Decisions I made, not the AI
+- Claude Code asked four questions before writing code, and I chose its recommended option each time:
+  - map the 13 extra encounter-type spellings;
+  - use the proposed payer table, including BadgerCare Plus → MEDICAID and Uninsured → SELF_PAY;
+  - make unmapped values NULL with a reason, and blank values UNKNOWN with a warning flag;
+  - keep a valid ICD-10 code missing from the reference, with a warning flag, and check roster presence for NPIs separately.
+- CANCELLED → VOID was decided before D2.
+
+### Corrections
+- No D2 test failed during the build.

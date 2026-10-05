@@ -237,10 +237,89 @@ whether it is an implementation choice still open for review.
   `tzdata==2025.2` package already pinned in `requirements.txt`. No dependency
   was added.
 
+## Task 2 parsers: categorical fields (D2)
+
+- **The brief fixes only the target categories,** not the source spellings,
+  so every source-to-category mapping is a decision. The mappings live in one
+  table per field in `src/pipeline/parsers/categorical.py`, the code option
+  the brief allows, so no new config mechanism was needed. Together the tables
+  cover every spelling in batches 001–003. *(Approved.)*
+- **Spellings are matched on a normalised key:** upper case, runs of
+  whitespace collapsed, and no spaces around hyphens. That is how the data's
+  `Closed - Paid` matches `Closed-Paid`. No other fuzzy matching is done.
+- **encounter_type.**
+  - The specified spellings: `ED`, `ER`, `Emergency Room`, `EMERGENCY DEPT` →
+    EMERGENCY; `IP`, `INPT`, `IN-PATIENT`, `inpatient admission` → INPATIENT;
+    `OBS`, `Obs Stay` → OBSERVATION; `OTHER` → UNKNOWN. The literal category
+    names map to themselves.
+  - 13 further spellings in about 2,000 of the 3,636 rows had no mapping in
+    the brief, and they are mapped as well: `OP`, `Out Patient`,
+    `Office Visit`, `Clinic Visit` → OUTPATIENT; `TELEMED`, `Video Visit`,
+    `Virtual` → TELEHEALTH; `UC`, `Walk-in Urgent` → URGENT_CARE. Leaving them
+    unmapped would have left over half the rows without an encounter type.
+    *(Approved.)*
+- **claim_status:**
+  - `Paid in Full`, `Closed-Paid`, `Paid` → PAID;
+  - `Denied`, `Rejected` → DENIED;
+  - `Pending`, `In Process`, `Submitted` → SUBMITTED;
+  - `Void`, `VOIDED`, `CANCELLED`, `Cancelled` → VOID.
+
+  *(Approved, including CANCELLED → VOID, which was decided before D2.)*
+- **payer_name → payer_category.** The raw payer name is kept alongside the
+  category. *(Approved.)*
+  - MEDICARE: `Medicare`, `MCR`, `MEDICARE PART A`, `Medicare - Part B`.
+  - MEDICAID: `Medicaid`, `IA Medicaid`, `State Medicaid Plan`, and
+    `BadgerCare Plus`, which is Wisconsin's Medicaid program.
+  - COMMERCIAL: `Aetna`, `AETNA INC`, `Cigna`, `CIGNA HEALTH`,
+    `UnitedHealthcare`, `UHC`, `BCBS`, `Blue Cross Blue Shield`.
+  - SELF_PAY: `Self Pay`, `self-pay`, `SELFPAY`, `Uninsured`.
+  - OTHER: `TRICARE`, `Workers Comp`.
+  - UNKNOWN: `N/A`.
+- **Blank and unmapped values.** *(Approved.)*
+  - A blank encounter_type or payer becomes UNKNOWN with a `*_MISSING`
+    warning flag, so the blank is still visible.
+  - A blank claim_status is NULL with `CLAIM_STATUS_MISSING`, because the
+    brief has no UNKNOWN status.
+  - A spelling in no table is NULL with `*_UNMAPPED`. It is never put in
+    UNKNOWN or any other category, so a new source spelling shows up instead
+    of being silently counted. None occurs in batches 001–003.
+
+## Task 2 parsers: diagnosis codes and NPIs (D2)
+
+- **ICD-10 normalisation:** strip, drop a trailing description after the
+  first `-` (ICD-10 codes never contain `-`), upper-case, and insert the dot
+  after the third character when it is missing. The result must match the
+  ICD-10 shape: a letter, a digit, an alphanumeric, then optionally a dot and
+  1–4 alphanumerics.
+- **The brief's four outcomes, kept distinct:** *(Approved.)*
+  - in the reference: the code;
+  - valid format but not in the reference: the code is kept, with warning
+    flag `DX_NOT_IN_REFERENCE`;
+  - ICD-9: NULL with `DX_ICD9`, and never mapped to ICD-10;
+  - anything else: NULL with `DX_UNPARSEABLE`, `DX_MISSING` or
+    `DX_PLACEHOLDER`.
+- **Only numeric ICD-9 codes are recognised** (three digits, optionally `.d`
+  or `.dd`), as seen in Meditech. ICD-9 V and E codes have the same shape as
+  valid ICD-10 codes, so telling them apart would be a guess. None occur in
+  the data.
+- **The ICD reference is loaded outside the parser**
+  (`src/pipeline/reference_data.py`) and checked to be in the normalised
+  format. The parser receives the codes as an argument, so it does no file
+  I/O.
+- **NPI cleaning is limited to harmless formatting:** surrounding whitespace
+  and a trailing `.0` left by a spreadsheet storing the NPI as a number (80
+  Athena values). Prefixes, separators and letters are not stripped; they make
+  the value `NPI_INVALID_FORMAT`.
+- **NPI validation follows CMS:** exactly 10 digits, with the 10th digit the
+  Luhn check digit of `80840` plus the first nine. A failure is
+  `NPI_CHECKSUM_FAILED`.
+- **Roster presence is a separate check.** `npi_not_in_roster()` reports
+  `NPI_NOT_IN_ROSTER` for a valid NPI found in none of the roster snapshots it
+  is given, and the NPI stays valid. Loading the rosters and point-in-time
+  provider lookup belong to a later step. *(Approved.)*
+
 ## Approved for later groups (not implemented yet)
 
-- `claim_status` values `CANCELLED` and `Cancelled` map to `VOID`. This
-  belongs to the categorical mappings in D2.
 - **The Docker container runs as root**, with no `USER` directive. A
   bind-mounted `./output` owned by a different user on a Linux host could make
   a non-root container fail to write, which would break the required exit
