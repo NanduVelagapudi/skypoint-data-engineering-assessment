@@ -1,0 +1,101 @@
+{
+  "canonical_columns": [
+    "source_system",
+    "source_record_id",
+    "facility_name",
+    "patient_mrn",
+    "patient_first_name",
+    "patient_last_name",
+    "patient_dob",
+    "patient_sex",
+    "patient_zip",
+    "patient_phone",
+    "admit_date",
+    "discharge_date",
+    "encounter_type",
+    "attending_npi",
+    "attending_provider_name",
+    "primary_dx_code",
+    "chief_complaint",
+    "payer_name",
+    "billed_amount",
+    "claim_status",
+    "last_updated_ts",
+    "encounter_source"
+  ],
+  "source_systems": {
+    "EPIC_NORTH": {
+      "file_name": "encounters_epic_north.csv",
+      "encoding": "utf-8",
+      "header_versions": [
+        {
+          "version": "epic_north_v1",
+          "description": "Original encounter layout.",
+          "columns": [
+            "source_system", "source_record_id", "facility_name", "patient_mrn",
+            "patient_first_name", "patient_last_name", "patient_dob", "patient_sex",
+            "patient_zip", "patient_phone", "admit_date", "discharge_date",
+            "encounter_type", "attending_npi", "attending_provider_name", "primary_dx_code",
+            "chief_complaint", "payer_name", "billed_amount", "claim_status",
+            "last_updated_ts"
+          ],
+          "renames": {}
+        }
+      ]
+    },
+    "LEGACY_MEDITECH": {
+      "file_name": "encounters_legacy_meditech.csv",
+      "encoding": "utf-8",
+      "header_versions": [
+        {
+          "version": "legacy_meditech_v1",
+          "description": "Original encounter layout.",
+          "columns": [
+            "source_system", "source_record_id", "facility_name", "patient_mrn",
+            "patient_first_name", "patient_last_name", "patient_dob", "patient_sex",
+            "patient_zip", "patient_phone", "admit_date", "discharge_date",
+            "encounter_type", "attending_npi", "attending_provider_name", "primary_dx_code",
+            "chief_complaint", "payer_name", "billed_amount", "claim_status",
+            "last_updated_ts"
+          ],
+          "renames": {}
+        }
+      ]
+    },
+    "ATHENA_CLINICS": {
+      "file_name": "encounters_athena_clinics.csv",
+      "encoding": "utf-8",
+      "header_versions": [
+        {
+          "version": "athena_clinics_v1",
+          "description": "Original encounter layout (batch_001, batch_002).",
+          "columns": [
+            "source_system", "source_record_id", "facility_name", "patient_mrn",
+            "patient_first_name", "patient_last_name", "patient_dob", "patient_sex",
+            "patient_zip", "patient_phone", "admit_date", "discharge_date",
+            "encounter_type", "attending_npi", "attending_provider_name", "primary_dx_code",
+            "chief_complaint", "payer_name", "billed_amount", "claim_status",
+            "last_updated_ts"
+          ],
+          "renames": {}
+        },
+        {
+          "version": "athena_clinics_v2",
+          "description": "Unannounced change first seen in batch_003: attending_npi renamed to attending_provider_npi, billed_amount renamed to total_charge, encounter_source added, columns reordered.",
+          "columns": [
+            "source_system", "source_record_id", "facility_name", "encounter_source",
+            "admit_date", "discharge_date", "encounter_type", "patient_mrn",
+            "patient_last_name", "patient_first_name", "patient_dob", "patient_sex",
+            "patient_zip", "patient_phone", "attending_provider_npi", "attending_provider_name",
+            "primary_dx_code", "chief_complaint", "payer_name", "total_charge",
+            "claim_status", "last_updated_ts"
+          ],
+          "renames": {
+            "attending_provider_npi": "attending_npi",
+            "total_charge": "billed_amount"
+          }
+        }
+      ]
+    }
+  }
+}

@@ -16,9 +16,10 @@ dist/
 .coverage
 htmlcov/
 
-# DuckDB (may contain raw PHI)
+# DuckDB (may contain raw PHI); work/ is the default local raw DB folder
 *.duckdb
 *.duckdb.wal
+work/
 
 # IDE and OS files
 .vscode/
