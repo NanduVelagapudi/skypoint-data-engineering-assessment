@@ -95,3 +95,28 @@
 
 ### Corrections
 - No D2 test failed during the build.
+
+## Task 2 facility resolution (D3)
+
+### Where it saved time
+- Profiled every `facility_name` value per source system in batches 001–003 (36 distinct values; organisation names, not PHI). Each value turned out to be one of:
+  - an exact master name;
+  - a master name that differs only in case or whitespace;
+  - an abbreviation or spelling variant with a single candidate in its own system;
+  - one of two names not in the master.
+- Checked the three points in my prompt against the files rather than assuming them:
+  - the master has 8 facilities;
+  - `Saint Brendan Medic` occurs only in rejected batch_004;
+  - `Westfield Surgical Center` and `TEST FACILITY - DO NOT USE` are not in the master.
+- Ran the resolver over all 3,636 accepted rows and reported counts only. The per-facility totals matched the profile: 3,604 resolved and 32 unresolved.
+
+### Decisions
+- Mine, set in my prompt: resolve within the source system, be conservative, no fuzzy matching unless the data proves it necessary, and no aliases built from rejected data.
+- Claude Code's, which I then reviewed:
+  - **The 22 aliases**, each a single-candidate variant within its own system.
+    - I reviewed and approved the four shortened aliases: `Lakeshore General` → FAC001, `Riverbend CH` → FAC004, `Harbor Point BH` → FAC005 and `Cedar Valley Clinic` → FAC006. I checked that each is an exact value observed in accepted batches 001–003, is scoped to its own source system, has exactly one candidate facility there, and resolves by deterministic exact matching without fuzzy matching.
+    - The remaining 18 aliases are still open for my review.
+  - **Keeping the aliases in `config/facility_aliases.json`**, checked against the facility master at load time. This is still open for my review.
+
+### Corrections
+- Its first batch_004 check skipped records with the wrong field count. That skipped the truncated record 18, the only place `Saint Brendan Medic` occurs, so the check came back empty. It noticed the empty result and re-checked that record's facility field alone, without printing any other field.

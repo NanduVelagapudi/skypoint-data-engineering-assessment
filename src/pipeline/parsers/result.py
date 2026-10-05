@@ -57,6 +57,9 @@ class FieldReason(StrEnum):
     NPI_CHECKSUM_FAILED = "NPI_CHECKSUM_FAILED"
     NPI_NOT_IN_ROSTER = "NPI_NOT_IN_ROSTER"
 
+    FACILITY_MISSING = "FACILITY_MISSING"
+    FACILITY_UNRESOLVED = "FACILITY_UNRESOLVED"
+
 
 # Placeholder words seen in the data pack or named in the brief. Compared after
 # stripping and upper-casing. Anything else that does not parse is UNPARSEABLE.

@@ -1,0 +1,48 @@
+{
+  "description": "Known spellings of facility master names, per source system. Each alias is a case, abbreviation or spelling variant seen in accepted batches 001-003 that has exactly one candidate facility in its own source system. facility_name repeats the master name for readability and is checked against it at load time.",
+  "source_systems": {
+    "EPIC_NORTH": {
+      "FAC001": {
+        "facility_name": "Lakeshore General Hospital",
+        "aliases": ["Lakeshore Gen Hosp", "Lakeshore General"]
+      },
+      "FAC002": {
+        "facility_name": "St. Brendan Medical Center",
+        "aliases": [
+          "St Brendan Medical Center",
+          "ST BRENDAN MED CTR",
+          "Saint Brendan Medical Center",
+          "St. Brendan's Medical Center"
+        ]
+      },
+      "FAC003": {
+        "facility_name": "Maple Grove Pediatrics",
+        "aliases": ["Maple Grove Pediatric Clinic", "MAPLE GROVE PEDS"]
+      }
+    },
+    "LEGACY_MEDITECH": {
+      "FAC004": {
+        "facility_name": "Riverbend Community Hospital",
+        "aliases": ["Riverbend CH", "Riverbend Community Hosp.", "RIVERBEND COMM HOSP"]
+      },
+      "FAC005": {
+        "facility_name": "Harbor Point Behavioral Health",
+        "aliases": ["HARBOR PT BEHAVIORAL HLTH", "Harborpoint Behavioral Health", "Harbor Point BH"]
+      }
+    },
+    "ATHENA_CLINICS": {
+      "FAC006": {
+        "facility_name": "Cedar Valley Family Clinic",
+        "aliases": ["Cedar Vly Family Clinic", "Cedar Valley Clinic"]
+      },
+      "FAC007": {
+        "facility_name": "Eastgate Urgent Care",
+        "aliases": ["EASTGATE UC", "Eastgate Urgent Care Center", "East Gate Urgent Care"]
+      },
+      "FAC008": {
+        "facility_name": "Summit Ridge Orthopedics",
+        "aliases": ["Summit Ridge Ortho", "SUMMIT RIDGE ORTHOPAEDICS", "Summit Ridge Orthopedic Clinic"]
+      }
+    }
+  }
+}

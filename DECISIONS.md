@@ -318,6 +318,71 @@ whether it is an implementation choice still open for review.
   is given, and the NPI stays valid. Loading the rosters and point-in-time
   provider lookup belong to a later step. *(Approved.)*
 
+## Task 2 facility resolution (D3)
+
+- **Resolution is within the row's source system,** as the brief says. The
+  lookup key is `(source_system, normalised name)`, so the same name in two
+  systems can never resolve across them. Each facility in the master belongs
+  to exactly one source system. *(Required by the reviewer.)*
+- **No fuzzy matching.** The brief allows "an alias table, fuzzy matching or
+  both". Normalisation plus an explicit alias table resolves every accepted
+  value that has a facility in the master, so a fuzzy threshold would add
+  false-merge risk and resolve nothing extra. There is no partial or prefix
+  matching either.
+- **Normalisation** reuses the categorical key: upper case, runs of
+  whitespace collapsed, and no spaces around hyphens. Punctuation is not
+  removed, so `St.` vs `St` is handled by an alias, not by normalisation.
+  This keeps every non-trivial match visible in the alias table.
+- **Aliases live in `config/facility_aliases.json`,** grouped by source system
+  and facility id. They are curated mappings onto IDs from the external
+  facility master, so at load time they are checked against it: the facility
+  must exist, belong to that source system, and have the master name written
+  next to it. Unlike the categorical tables, which map onto categories fixed
+  by the brief, this table is master-data configuration, so it lives in
+  `config/`. *(Open for review.)*
+- **The 22 aliases** cover every case, abbreviation and spelling variant in
+  batches 001–003. Each has exactly one candidate facility with that name in
+  its own source system. *(The four shortened aliases are reviewed and
+  approved, see below; the other 18 are open for review.)*
+  - EPIC_NORTH:
+    - FAC001: `Lakeshore Gen Hosp`, `Lakeshore General`
+    - FAC002: `St Brendan Medical Center`, `ST BRENDAN MED CTR`,
+      `Saint Brendan Medical Center`, `St. Brendan's Medical Center`
+    - FAC003: `Maple Grove Pediatric Clinic`, `MAPLE GROVE PEDS`
+  - LEGACY_MEDITECH:
+    - FAC004: `Riverbend CH`, `Riverbend Community Hosp.`,
+      `RIVERBEND COMM HOSP`
+    - FAC005: `HARBOR PT BEHAVIORAL HLTH`, `Harborpoint Behavioral Health`,
+      `Harbor Point BH`
+  - ATHENA_CLINICS:
+    - FAC006: `Cedar Vly Family Clinic`, `Cedar Valley Clinic`
+    - FAC007: `EASTGATE UC`, `Eastgate Urgent Care Center`,
+      `East Gate Urgent Care`
+    - FAC008: `Summit Ridge Ortho`, `SUMMIT RIDGE ORTHOPAEDICS`,
+      `Summit Ridge Orthopedic Clinic`
+- **The four shortened aliases:** `Lakeshore General` → FAC001,
+  `Riverbend CH` → FAC004, `Harbor Point BH` → FAC005 and
+  `Cedar Valley Clinic` → FAC006. These shorten the master name rather than
+  just abbreviating or re-spelling it, so they were reviewed manually. Each one:
+  - is an exact value observed in accepted batches 001–003;
+  - is scoped to its own source system;
+  - has exactly one candidate facility in that source system;
+  - resolves by deterministic exact matching, with no fuzzy matching.
+
+  *(Reviewed and approved.)*
+- **Ambiguity is a configuration error,** not a runtime outcome. Building the
+  index refuses any name or alias that would point at two facilities in the
+  same system, so a resolution can never be ambiguous.
+- **Unresolved values are NULL with a reason and never guessed:**
+  `FACILITY_MISSING` for a blank, `FACILITY_UNRESOLVED` otherwise. The brief
+  sends these rows to quarantine; that is Task 6. In batches 001–003 this
+  covers `TEST FACILITY - DO NOT USE` (7 Epic rows) and
+  `Westfield Surgical Center` (25 Athena rows); neither is in the facility
+  master.
+- **Rejected data adds no aliases.** `Saint Brendan Medic` occurs only as the
+  cut-off facility value of the truncated record in rejected batch_004, so it
+  is not an alias and stays unresolved.
+
 ## Approved for later groups (not implemented yet)
 
 - **The Docker container runs as root**, with no `USER` directive. A
