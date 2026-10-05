@@ -8,7 +8,7 @@ import logging
 from pathlib import Path
 
 import pytest
-from conftest import CONTRACT_PATH, REAL_DATA_DIR, REPO_ROOT
+from conftest import CONTRACT_PATH, REAL_DATA_DIR, REPO_ROOT, TEST_PATIENT_KEY_SECRET
 
 from pipeline.main import main
 from pipeline.raw_store import open_store
@@ -47,6 +47,7 @@ def run(tmp_path_factory):
         "RAW_DB_PATH": str(tmp / "work" / "raw.duckdb"),
         "SCHEMA_CONTRACT_PATH": str(CONTRACT_PATH),
         "LOG_LEVEL": "WARNING",
+        "PATIENT_KEY_HMAC_SECRET": TEST_PATIENT_KEY_SECRET,
     }
     data_before = fingerprint(REAL_DATA_DIR)
     repo_output_before = fingerprint(REPO_ROOT / "output")

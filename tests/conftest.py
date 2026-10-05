@@ -23,6 +23,9 @@ REAL_DATA_DIR = REPO_ROOT / "data"
 
 UTF8_BOM = b"\xef\xbb\xbf"
 
+# Test-only HMAC key for patient_key. Not a real secret.
+TEST_PATIENT_KEY_SECRET = "test-only-patient-key-secret-ZZSECRET"
+
 
 @dataclass(frozen=True)
 class FileSpec:
@@ -126,7 +129,9 @@ def pipeline_env(tmp_path: Path, landing_dir: Path) -> dict[str, str]:
         "OUTPUT_DIR": str(tmp_path / "output"),
         "RAW_DB_PATH": str(tmp_path / "work" / "raw.duckdb"),
         "SCHEMA_CONTRACT_PATH": str(CONTRACT_PATH),
+        "REFERENCE_DIR": str(REAL_DATA_DIR / "reference"),
         "LOG_LEVEL": "INFO",
+        "PATIENT_KEY_HMAC_SECRET": TEST_PATIENT_KEY_SECRET,
     }
 
 

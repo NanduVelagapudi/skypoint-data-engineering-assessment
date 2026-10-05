@@ -383,6 +383,139 @@ whether it is an implementation choice still open for review.
   cut-off facility value of the truncated record in rejected batch_004, so it
   is not an alias and stays unresolved.
 
+## Task 3: protecting patient data
+
+### What reaches the cleaned layer
+- **`clean.encounter_patients`** holds one row per accepted raw row, with only
+  PHI-free patient attributes:
+  - `patient_key`, `patient_link_status` and `patient_link_reason`;
+  - `sex`, normalised, with its reason;
+  - `age_band` and `zip3`, each with its reason;
+  - lineage (`batch_id`, `file_name`, `source_row_number`) and the non-PHI
+    source identifiers `source_system` and `source_record_id`.
+
+  *(Table, grain and columns open for review.)*
+- **Never stored downstream:** `patient_mrn`, first and last name, DOB, phone,
+  full ZIP and `chief_complaint`. These are read from the raw layer and used
+  in memory only, for linkage, the age band and the ZIP3. They are never
+  logged or put in an error. The table's column list is checked against
+  these PHI column names when the module loads, and tests check both the
+  columns and the stored values. *(Required by the reviewer.)*
+- **`chief_complaint` is left out entirely, not redacted.** Batches 001–003
+  have 14 complaints with a phone-number pattern and 4 containing the
+  patient's own name. Redaction belongs to the Bonus. *(Required by the
+  reviewer.)*
+- **Only normalised sex is kept downstream:** `F`, `M` or `UNKNOWN`, with
+  `sex_reason` when it is UNKNOWN. The brief does not list sex as PHI, and the
+  required export includes it.
+  - The source spelling (`Female`, `M`, …) is read and normalised in memory,
+    but `sex_raw` is not stored in the clean table. It would only duplicate
+    `sex`, and the clean layer keeps the minimum necessary.
+  - The original value stays available in the restricted raw layer
+    (`raw.encounters.patient_sex`).
+
+  *(Required by the reviewer.)*
+- **The table is rebuilt from all accepted raw rows on every run,** in one
+  transaction, because linkage looks across every batch and source system.
+  The same secret and the same raw rows always give identical output.
+  Incremental history is Task 4. *(Open for review.)*
+- **It lives in the same DuckDB file** as the raw layer, in a separate `clean`
+  schema. DuckDB controls access per file, so the separation here is by
+  content. In production, raw and cleaned data would sit in separate,
+  separately permissioned catalogs. *(Open for review.)*
+- **`source_system` comes from `raw.ingested_files`,** which was validated
+  against the manifest and schema contract, not from the row's own delivered
+  `source_system` column.
+
+### Patient linkage
+- **Only the brief's minimum rule,** with all four fields required:
+  normalised last name, first given name, DOB and sex. No fuzzy matching, no
+  nickname matching, and no fallback rule. *(Required by the reviewer.)*
+  - **Last name:** trim, upper-case, then remove everything that is not a
+    letter or digit, so `O'Testa`, `O Testa` and `OTESTA` match.
+  - **First given name:** trim, upper-case, take the first whitespace token
+    and remove its punctuation. Later tokens, including middle initials, are
+    ignored. A single-letter first token is kept, not dropped as an initial.
+    In batches 001–003, 25 cross-system groups link only because the middle
+    initial is ignored. Known false-split risk: `Mary Ann` gives `MARY`, but
+    `Mary-Ann` gives `MARYANN`. No such case occurs in the data.
+  - **DOB:** parsed by the D1 date parser with the source's date order and
+    the batch's delivery cutoff, and used in memory only.
+  - **Sex:** `F`/`Female` → F and `M`/`Male` → M. Anything else is UNKNOWN and
+    cannot link.
+- **An identity is `(source_system, MRN)`,** never the MRN alone.
+  - An identity with a DOB on any of its rows is linkable.
+  - An identity with no DOB on any row is never linked across systems.
+    That covers 12 identities and 34 rows. *(Required by the reviewer.)*
+  - An identity whose rows give two different linkage keys is not linked
+    (`PATIENT_UNLINKED_CONFLICT`); none occurs in the data. *(Open for
+    review.)*
+- **A false merge is clinically worse than a false split.** Merging two people
+  puts one patient's diagnoses, medications and allergies into another's
+  history, which can lead directly to a wrong treatment decision. A split
+  leaves one person's history in two pieces: incomplete, but not wrong. The
+  rule therefore stays conservative. The near-misses it deliberately leaves
+  unlinked are:
+  - 2 clusters that differ only in sex;
+  - 3 with a different first name;
+  - 1 with a different last name;
+  - 4 DOB pairs that are close enough to be typos.
+
+  *(Required by the reviewer.)*
+- **Results on batches 001–003:**
+  - 1,056 identities, of which 1,044 are linked;
+  - 895 person groups, 142 of them across systems (135 span two systems and
+    7 span three);
+  - 0 groups holding two MRNs from the same system.
+
+### patient_key
+- **`patient_key` is HMAC-SHA256** over a canonical JSON payload, hex-encoded,
+  using the standard library's `hmac` and `hashlib`. *(Required by the
+  reviewer.)*
+  - Linked: `["patient_key/v1", "LINKED", last, first, dob ISO, sex]`.
+  - Unlinked: `["patient_key/v1", "UNLINKED", source_system, MRN]`.
+  - The namespace keeps the two kinds from ever colliding. The unlinked
+    payload includes the source system, so an unlinked key can never join
+    identities across systems. JSON encoding makes the payload unambiguous,
+    and the version string allows a deliberate change later.
+- **A blank MRN gets no key** (`PATIENT_MRN_MISSING`), so all blank-MRN rows
+  are never merged into one patient. None occurs in the data. *(Open for
+  review.)*
+- **The key can change.** It is derived from the identity's current
+  attributes, so an identity that is unlinked today gets a different, LINKED
+  key if a later batch supplies a valid DOB, and a corrected name or DOB also
+  changes it. Re-runs on the same data always give the same keys. No
+  persistent patient master or crosswalk is built to keep old keys stable;
+  that is a production concern. *(Required by the reviewer.)*
+- **The secret comes from the `PATIENT_KEY_HMAC_SECRET` environment
+  variable.**
+  - It is checked before any work starts. A missing or blank value exits 1
+    with `MissingSecretError`, a `ConfigError`, so nothing is ingested or
+    cleaned.
+  - It is never hard-coded, never shown in `Settings`' repr, and never
+    logged.
+  - `.env.example` holds only the existing, clearly labelled
+    development-only placeholder.
+  - Changing the secret changes every key. *(Required by the reviewer.)*
+
+### Age band and ZIP3
+- **Age is whole years on the admit date:** `0-17`, `18-39`, `40-64`, `65+`.
+  UNKNOWN carries a reason:
+  - `AGE_BAND_DOB_UNAVAILABLE`: 34 rows;
+  - `AGE_BAND_ADMIT_UNAVAILABLE`: 18 rows;
+  - `AGE_BAND_DOB_AFTER_ADMIT`: 2 rows.
+
+  The result never carries the DOB.
+- **`zip3` is the first three digits of a 5-digit ZIP or a ZIP+4.** Anything
+  else is NULL with `ZIP_MISSING` or `ZIP_INVALID`. All 3,636 accepted values
+  are valid 5-digit ZIPs. Accepting ZIP+4 is an implementation choice. *(Open
+  for review.)* The HIPAA Safe Harbor rule of replacing low-population ZIP3s
+  with `000` is not applied, because the brief asks only for the first three
+  digits.
+- **`REFERENCE_DIR`** is a new path setting, defaulting to
+  `DATA_DIR/reference`. The cleaning stage needs the source conventions to
+  parse DOB and admit dates. *(Open for review.)*
+
 ## Approved for later groups (not implemented yet)
 
 - **The Docker container runs as root**, with no `USER` directive. A

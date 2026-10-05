@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from pipeline.errors import ConfigError
@@ -18,6 +18,10 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
 
 
+class MissingSecretError(ConfigError):
+    """PATIENT_KEY_HMAC_SECRET is not set. The class name is what the logs show."""
+
+
 @dataclass(frozen=True)
 class Settings:
     data_dir: Path
@@ -25,10 +29,21 @@ class Settings:
     raw_db_path: Path
     schema_contract_path: Path
     log_level: str
+    reference_dir: Path
+    # Never shown in repr, so printing or logging Settings cannot leak it.
+    patient_key_secret: str | None = field(default=None, repr=False)
 
     @property
     def landing_dir(self) -> Path:
         return self.data_dir / "landing"
+
+
+def require_patient_key_secret(settings: Settings) -> bytes:
+    """The HMAC key for patient_key. Missing or blank is a configuration error."""
+    secret = settings.patient_key_secret
+    if secret is None or not secret.strip():
+        raise MissingSecretError("PATIENT_KEY_HMAC_SECRET must be set to build patient_key")
+    return secret.encode("utf-8")
 
 
 def _path(env: Mapping[str, str], name: str, default: Path) -> Path:
@@ -39,15 +54,18 @@ def _path(env: Mapping[str, str], name: str, default: Path) -> Path:
 def load_settings(env: Mapping[str, str] | None = None) -> Settings:
     """Build Settings from `env` (defaults to os.environ) and validate them."""
     env = os.environ if env is None else env
+    data_dir = _path(env, "DATA_DIR", REPO_ROOT / "data")
 
     settings = Settings(
-        data_dir=_path(env, "DATA_DIR", REPO_ROOT / "data"),
+        data_dir=data_dir,
         output_dir=_path(env, "OUTPUT_DIR", REPO_ROOT / "output"),
         raw_db_path=_path(env, "RAW_DB_PATH", REPO_ROOT / "work" / "raw.duckdb"),
         schema_contract_path=_path(
             env, "SCHEMA_CONTRACT_PATH", REPO_ROOT / "config" / "schema_contracts.json"
         ),
         log_level=env.get("LOG_LEVEL", "INFO").strip().upper() or "INFO",
+        reference_dir=_path(env, "REFERENCE_DIR", data_dir / "reference"),
+        patient_key_secret=env.get("PATIENT_KEY_HMAC_SECRET"),
     )
 
     if settings.log_level not in LOG_LEVELS:

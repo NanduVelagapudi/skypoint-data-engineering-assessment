@@ -118,5 +118,31 @@
     - The remaining 18 aliases are still open for my review.
   - **Keeping the aliases in `config/facility_aliases.json`**, checked against the facility master at load time. This is still open for my review.
 
-### Corrections
+### Corrections (D3)
 - Its first batch_004 check skipped records with the wrong field count. That skipped the truncated record 18, the only place `Saint Brendan Medic` occurs, so the check came back empty. It noticed the empty result and re-checked that record's facility field alone, without printing any other field.
+## Task 3: protecting patient data
+
+### Where it saved time
+- Before writing any code, it ran a read-only profile of batches 001–003 that printed only counts and patterns. It covered MRN shapes, DOB validity, name punctuation and middle initials, sex labels, linkage under the minimum rule, near-miss categories, free-text identifier patterns, age bands and ZIP shapes. This gave the expected counts that the real-data tests now pin.
+- It checked the finished stage against the real data through an in-memory DuckDB, so no files were written, and reported counts only. Every expected figure matched: 1,056 identities, 1,044 linked, 895 person groups, 142 cross-system groups, 0 same-system collisions, and the five age-band counts.
+- It wrote the HMAC, linkage and cleaning code with 108 new tests. These cover name, sex, age-band and ZIP rules; HMAC payloads checked against an independent `hmac` call; source-scoped unlinked keys; and a missing secret. They also check that no PHI value or secret reaches the cleaned table, the logs or an error.
+
+### Decisions I made, not the AI
+- The Task 3 rules in my prompt:
+  - the four-field linkage, with no fuzzy, nickname or fallback rule;
+  - the LINKED and UNLINKED namespaces, with source-scoped unlinked keys;
+  - the secret only from `PATIENT_KEY_HMAC_SECRET`, failing before any cleaned output;
+  - `chief_complaint` left out, not redacted;
+  - DOB never persisted;
+  - documenting that a key can change once an identity becomes linkable.
+- **My removal of `sex_raw`.** Claude Code's first cleaned table stored the raw sex label (`Female`, `M`, …) as `sex_raw` next to the normalised `sex`. I had it removed on the minimum-necessary principle: nothing downstream needs the source spelling, and it only duplicates `sex`. The raw value is still read and normalised in memory, and stays only in the restricted raw layer.
+- **My override on single-letter first names.** In its inspection, Claude Code proposed dropping every single-letter token from the first name and taking the first remaining token, which would discard a legitimate one-letter first name. My Task 3 rule instead takes the first token as the given name and ignores only the tokens after it.
+
+### Corrections
+- **Wrong source of `source_system`.** Its first cleaning stage read the row's own delivered `source_system` column instead of the file's validated source system in `raw.ingested_files`. Real data happens to agree, but synthetic test rows do not, so 9 existing tests failed. It now uses the validated value.
+- **Over-broad PHI test.** Its first PHI-leak test treated every synthetic patient field as PHI, including sex. Sex is not PHI, and at that point the raw label was stored as `sex_raw`, so the test would have failed wrongly. It noticed this before running the test and limited the check to the PHI columns.
+- **Shell quoting during profiling.** Two of its read-only profiling commands failed in the bash tool because the Python scripts held an unpaired single quote. Nothing ran. It reran the same scripts through PowerShell.
+
+### Choices still open for my review
+- The cleaned table: its name, grain and columns; rebuilding it in full on each run; and keeping it in the same DuckDB file under a separate `clean` schema.
+- `PATIENT_UNLINKED_CONFLICT` for an identity whose rows disagree, no key for a blank MRN, ZIP+4 accepted for ZIP3, and the new `REFERENCE_DIR` setting.
