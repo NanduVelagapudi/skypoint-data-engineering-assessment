@@ -23,6 +23,8 @@ import pytest
 from pipeline.parsers.amount import parse_amount
 from pipeline.parsers.categorical import ClaimStatus, parse_claim_status
 from pipeline.parsers.dates import parse_date
+from pipeline.parsers.facility import resolve_facility
+from pipeline.reference_data import load_cleaning_reference
 from pipeline.source_conventions import load_source_conventions
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -320,8 +322,10 @@ def state_digest(db_path: Path, *, exclude_run_times: bool = True) -> dict[str, 
 def independent_monthly_totals(con, as_of_batch: str | None = None) -> dict[tuple[int, int], tuple[int, Decimal]]:
     """Encounters and billed total per admit month, excluding VOID, computed independently of the mart.
 
-    It re-parses the raw admit date, amount and claim status of each current version with the Task 2
-    parsers, so the mart queries (README queries 1 and 5) can be checked against it.
+    It re-parses the raw admit date, amount, claim status and facility of each current version with
+    the Task 2 parsers, so the mart queries (README queries 1 and 5) can be checked against it. Like
+    them it leaves out a current version with a Task 6 ERROR: an unusable admit date (no month) or an
+    unresolved facility. It does not read the DQ tables.
 
     as_of_batch=None reads clean.encounter_current. Otherwise the current
     version is chosen among the versions known by the end of that batch.
@@ -341,14 +345,17 @@ def independent_monthly_totals(con, as_of_batch: str | None = None) -> dict[tupl
         ), [as_of_batch]
     rows = con.execute(
         f"WITH picked AS ({picked}) "
-        "SELECT f.source_system, f.delivered_at, e.admit_date, e.billed_amount, e.claim_status "
+        "SELECT f.source_system, f.delivered_at, e.admit_date, e.billed_amount, e.claim_status, e.facility_name "
         "FROM picked p JOIN raw.encounters e USING (batch_id, file_name, source_row_number) "
         "JOIN raw.ingested_files f USING (batch_id, file_name)",
         params,
     ).fetchall()
     conventions = load_source_conventions(REAL_DATA_DIR / "reference" / "source_systems_and_facilities.json")
+    facilities = load_cleaning_reference(REAL_DATA_DIR / "reference", REPO_ROOT / "config" / "facility_aliases.json").facility_index
     totals: dict[tuple[int, int], list] = defaultdict(lambda: [0, Decimal("0.00")])
-    for system, delivered_at, admit_text, amount_text, status_text in rows:
+    for system, delivered_at, admit_text, amount_text, status_text, facility_text in rows:
+        if resolve_facility(facility_text, system, facilities).cleaned_value is None:
+            continue  # a Task 6 ERROR: the encounter is left out of the totals
         convention = conventions[system]
         admit = parse_date(
             admit_text,

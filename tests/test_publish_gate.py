@@ -66,8 +66,15 @@ def digest_without_reporting(env):
     return {t: d for t, d in state_digest(Path(env["RAW_DB_PATH"])).items() if t not in REPORTING_TABLES}
 
 
+REPORTING_CSVS = ("batch_audit.csv", "dq_report.csv", "quarantine.csv")  # they report rejected batches too
+
+
 def exported(env):
-    return {p.name: p.read_bytes() for p in Path(env["OUTPUT_DIR"]).glob("*.csv") if p.name != "batch_audit.csv"}
+    return {p.name: p.read_bytes() for p in Path(env["OUTPUT_DIR"]).glob("*.csv") if p.name not in REPORTING_CSVS}
+
+
+def csv_lines(env, name):
+    return (Path(env["OUTPUT_DIR"]) / name).read_text(encoding="utf-8").splitlines()
 
 
 # --- unit ------------------------------------------------------------------
@@ -135,7 +142,8 @@ def gate_rejected(landing_dir, pipeline_env, roster_npi, capsys):
     env = with_threshold(pipeline_env, "0.05")
     write_batch(landing_dir, "batch_001", [epic_file(good("A", 10), roster_npi=roster_npi)])
     assert main(env) == 0
-    before = {"digest": digest_without_reporting(env), "exports": exported(env)}
+    before = {"digest": digest_without_reporting(env), "exports": exported(env),
+              "reporting": {name: csv_lines(env, name) for name in ("dq_report.csv", "quarantine.csv")}}  # fmt: skip
     bad = [*good("B", 8), ("B9", BAD_FACILITY), ("B10", BAD_FACILITY)]
     write_batch(landing_dir, "batch_002", [epic_file(bad, roster_npi=roster_npi)])
     capsys.readouterr()
@@ -159,6 +167,10 @@ def test_a_rejected_batch_publishes_nothing(gate_rejected):
 
     assert digest_without_reporting(env) == gate_rejected["before"]["digest"]
     assert exported(env) == gate_rejected["before"]["exports"]
+    for name, lines_before in gate_rejected["before"]["reporting"].items():  # only batch_002's lines are added
+        lines = csv_lines(env, name)
+        assert [line for line in lines if not line.startswith("batch_002,")] == lines_before, name
+        assert any(line.startswith("batch_002,") for line in lines), name
     for table, column in (("raw.encounters", "batch_id"), ("raw.ingested_files", "batch_id"),
                           ("clean.encounter_row_outcomes", "batch_id"), ("clean.encounter_versions", "first_seen_batch_id"),
                           ("clean.encounter_version_fields", "source_batch_id"), ("clean.encounter_patients", "batch_id"),

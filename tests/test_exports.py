@@ -14,10 +14,10 @@ from pathlib import Path
 import pytest
 from conftest import REPO_ROOT, FileSpec, attach, contract_header, csv_bytes, write_batch
 
-from pipeline import exports
+from pipeline import dq_report, exports, quarantine, version_dq
 from pipeline.clean_patients import PHI_COLUMNS
 from pipeline.errors import PipelineError
-from pipeline.exports import EXPORTED_TABLES, export_table, file_name, format_value
+from pipeline.exports import EXPORTED_TABLES, NULLS_FIRST, export_table, file_name, format_value
 from pipeline.main import main
 
 pytestmark = pytest.mark.usefixtures("restore_pipeline_logger")
@@ -112,8 +112,15 @@ def test_every_table_is_exported_with_its_columns_ordered_by_primary_key(loaded)
             header, *rows = read_csv(output / file_name(table))
             assert header == [r[0] for r in con.execute(f"DESCRIBE {table}").fetchall()], table
             assert len(rows) == con.execute(f"SELECT count(*) FROM {table}").fetchone()[0], table
-            positions = [header.index(c) for c in key]
-            keys = [tuple(int(r[i]) if c == "source_row_number" else r[i] for i, c in zip(positions, key)) for r in rows]
+            columns = [c.removesuffix(NULLS_FIRST) for c in key]
+            positions = [header.index(c) for c in columns]
+
+            def sort_value(value, column):
+                if column == "source_row_number":
+                    return int(value) if value else -1  # NULL (empty) sorts first
+                return value  # an empty string (NULL) already sorts first
+
+            keys = [tuple(sort_value(r[i], c) for i, c in zip(positions, columns)) for r in rows]
             assert keys == sorted(keys) and len(set(keys)) == len(keys), table
     finally:
         con.close()
@@ -141,7 +148,7 @@ def test_exports_are_rewritten_identically(loaded):
     assert {p.name: p.read_bytes() for p in output.iterdir() if p.name != "batch_audit.csv"} == before
 
 
-def test_only_clean_and_mart_tables_can_be_exported(loaded, tmp_path):
+def test_only_clean_mart_and_ops_tables_can_be_exported(loaded, tmp_path):
     con = attach(Path(loaded["RAW_DB_PATH"]))
     try:
         with pytest.raises(PipelineError, match="not in an exportable schema"):
@@ -260,6 +267,97 @@ def test_quarantined_rows_and_rejected_files_are_listed(loaded, landing_dir):
         con.close()
 
     assert rows == [
-        ("ROW", "batch_001", "encounters_epic_north.csv", 4, "SOURCE_RECORD_ID_MISSING"),
-        ("FILE", "batch_002", "encounters_epic_north.csv", None, "SHA256_MISMATCH"),
+        ("ROW", "HISTORY_ORDERING", "batch_001", "encounters_epic_north.csv", 4, "", None, None,
+         "SOURCE_RECORD_ID_MISSING", None),
+        ("FILE", "BATCH_VALIDATION", "batch_002", "encounters_epic_north.csv", None, None, None, None,
+         "SHA256_MISMATCH", "SHA256_MISMATCH"),
+    ]  # fmt: skip
+
+
+# --- Task 6: analytics exclude ERROR versions; the DQ tables are exported ---
+
+GOOD = {"facility_name": "Lakeshore General Hospital"}
+UNRESOLVED = {"facility_name": "Nowhere Clinic"}
+T2 = "2024-03-02T10:00:00Z"
+
+
+@pytest.fixture
+def with_errors(landing_dir, pipeline_env):
+    """batch_001: E1 passes, E2 has an unresolved facility, E3 is VOID, E4 passes.
+    batch_002: E4's newer version has an unresolved facility (it becomes current; no fallback)."""
+    write_batch(landing_dir, "batch_001", [encounter_file("EPIC_NORTH", [
+        ("E1", "2024-03-01T10:00:00Z", GOOD),
+        ("E2", "2024-03-01T10:00:00Z", UNRESOLVED),
+        ("E3", "2024-03-01T10:00:00Z", {"claim_status": "Void"}),
+        ("E4", "2024-03-01T10:00:00Z", GOOD),
+    ])])  # fmt: skip
+    write_batch(landing_dir, "batch_002", [encounter_file("EPIC_NORTH", [("E4", T2, UNRESOLVED)])])
+    assert main(pipeline_env) == 0  # the fixture's gate threshold is 1: both batches are published
+    return pipeline_env
+
+
+def test_monthly_queries_exclude_error_versions_without_fallback(with_errors):
+    con = attach(Path(with_errors["RAW_DB_PATH"]))
+    try:
+        current = run_query(con, "q1_monthly_volume_current.sql")
+        as_of_001 = run_query(con, "q5_monthly_volume_as_of.sql", as_of_batch="batch_001")
+        as_of_002 = run_query(con, "q5_monthly_volume_as_of.sql", as_of_batch="batch_002")
+        still_current = con.execute(
+            "SELECT source_record_id, source_batch_id, facility_id_reason FROM mart.fact_encounter_current "
+            "WHERE facility_id IS NULL ORDER BY 1").fetchall()  # fmt: skip
+    finally:
+        con.close()
+
+    month = (2024, 3, "FAC001", "Lakeshore General Hospital", "INPATIENT")
+    assert current == as_of_002 == [(*month, 1, Decimal("5000.00"))]  # E1 only: E2, E4 are ERRORs, E3 is VOID
+    assert as_of_001 == [(*month, 2, Decimal("10000.00"))]  # at batch_001, E4's passing version was current
+    # The ERROR versions stay current in the mart; the queries leave them out.
+    assert still_current == [("E2", "batch_001", "FACILITY_UNRESOLVED"), ("E4", "batch_002", "FACILITY_UNRESOLVED")]
+
+
+def test_q6_lists_version_errors_with_their_current_flag(with_errors):
+    con = attach(Path(with_errors["RAW_DB_PATH"]))
+    try:
+        rows = run_query(con, "q6_quarantined_and_rejected.sql")
+    finally:
+        con.close()
+
+    assert [(r[0], r[1], r[2], r[4], r[5], r[7], r[8]) for r in rows] == [
+        ("VERSION", "VERSION_DQ", "batch_001", 2, "E2", True, "FACILITY_UNRESOLVED"),
+        ("VERSION", "VERSION_DQ", "batch_002", 1, "E4", True, "FACILITY_UNRESOLVED"),
     ]
+
+
+@pytest.mark.parametrize(
+    "csv_name, module",
+    [("version_dq_issues.csv", version_dq), ("quarantine.csv", quarantine), ("dq_report.csv", dq_report)],
+)
+def test_dq_csvs_have_the_fixed_columns_and_order(with_errors, csv_name, module):
+    header, *rows = read_csv(Path(with_errors["OUTPUT_DIR"]) / csv_name)
+    con = attach(Path(with_errors["RAW_DB_PATH"]))
+    try:
+        order = getattr(module, "ORDER_BY", "version_key, check_code")
+        stored = con.execute(f"SELECT * FROM {module.TABLE} ORDER BY {order}").fetchall()
+    finally:
+        con.close()
+
+    assert header == list(module.COLUMNS)
+    assert rows == [[format_value(v) for v in row] for row in stored]  # same rows, same order, same formats
+
+
+def test_dq_report_csv_formats(with_errors):
+    header, *rows = read_csv(Path(with_errors["OUTPUT_DIR"]) / "dq_report.csv")
+    by_key = {(r[0], r[3], r[5]): dict(zip(header, r, strict=True)) for r in rows}
+
+    assert [r[3] for r in rows[:2]] == ["", ""]  # batch rows (file_name NULL) come first
+    gate = by_key[("batch_001", "", "PUBLISH_GATE")]
+    assert (gate["evaluated_count"], gate["observed_count"], gate["observed_pct"], gate["threshold_pct"]) == (
+        "4", "1", "25.00", "100.00")
+    facility = by_key[("batch_001", "encounters_epic_north.csv", "FACILITY_RESOLVED")]
+    assert (facility["observed_pct"], facility["expected_count"], facility["status"]) == ("25.00", "", "FAIL")
+    assert {r[header.index("threshold_pct")] for r in rows if r[5] != "PUBLISH_GATE"} == {""}
+
+
+def test_export_order_matches_the_dq_tables_order():
+    assert ", ".join(EXPORTED_TABLES[dq_report.TABLE]) == dq_report.ORDER_BY
+    assert ", ".join(EXPORTED_TABLES[quarantine.TABLE]) == quarantine.ORDER_BY

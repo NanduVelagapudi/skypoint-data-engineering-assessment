@@ -660,8 +660,18 @@ def test_exported_csvs_are_byte_identical(runs, run):
         assert runs[run]["exports"][name] == content, (run, name)
 
 
+REPORTING_CSVS = ("dq_report.csv", "quarantine.csv")  # they report every batch, rejected ones included
+
+
 def test_rejected_batch_004_changes_no_exported_csv(runs):
-    assert runs["batch_004"]["exports"] == runs["batch_003"]["exports"]
+    before, after = runs["batch_003"]["exports"], runs["batch_004"]["exports"]
+
+    assert {n: c for n, c in after.items() if n not in REPORTING_CSVS} == {
+        n: c for n, c in before.items() if n not in REPORTING_CSVS}
+    for name in REPORTING_CSVS:  # batch_004 only adds its own lines (both files sort by batch_id first)
+        lines = after[name].decode("utf-8").splitlines(keepends=True)
+        assert "".join(line for line in lines if not line.startswith("batch_004,")) == before[name].decode("utf-8"), name
+        assert any(line.startswith("batch_004,") for line in lines), name
 
 
 # --- Task 6 group (a): version DQ issues and the DQ report ---

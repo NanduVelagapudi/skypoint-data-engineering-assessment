@@ -1,18 +1,21 @@
-"""CSV export of every PHI-free clean and mart table to OUTPUT_DIR (Task 5).
+"""CSV export of every PHI-free clean and mart table, and the Task 6 DQ tables, to OUTPUT_DIR.
 
 One file per table, named after the table. Each file has:
     the table's columns in their fixed (DDL) order as the header;
-    rows ordered by the table's primary key;
+    rows ordered by the table's primary key, or for the DQ report and the
+    quarantine (whose keys can be NULL) by their fixed ORDER_BY, NULLs first;
     ISO 8601 dates; TIMESTAMP values (stored as naive UTC) as
     YYYY-MM-DDTHH:MM:SSZ, with fractional seconds only when present;
     DECIMAL amounts with exactly two decimals; booleans as true/false;
     NULL as an empty string;
     UTF-8, LF line endings, written through a temp file and a rename.
 
-Only tables in the clean and mart schemas can be exported, and a table with a
-PHI column (clean_patients.PHI_COLUMNS, also as a *_raw column) is refused, so
-nothing from the raw layer, no chief_complaint and no patient name reaches
-OUTPUT_DIR. batch_audit.csv is written separately by batch_audit.export_csv.
+Only tables in the clean, mart and ops schemas can be exported, and a table
+with a PHI column (clean_patients.PHI_COLUMNS, also as a *_raw column) is
+refused, so nothing from the raw layer, no chief_complaint and no patient name
+reaches OUTPUT_DIR. The ops tables exported are only the DQ report and the
+quarantine, which hold codes, keys and lineage. batch_audit.csv is written
+separately by batch_audit.export_csv.
 """
 
 from __future__ import annotations
@@ -31,7 +34,10 @@ from pipeline.errors import PipelineError
 
 log = logging.getLogger(__name__)
 
-# table -> its primary key, which orders the rows
+NULLS_FIRST = " NULLS FIRST"
+
+# table -> the columns that order its rows: its primary key, or the fixed order of a DQ table
+# (a column suffixed NULLS_FIRST puts its NULLs first)
 EXPORTED_TABLES = {
     "clean.encounter_versions": ("version_key",),
     "clean.encounter_row_outcomes": ("batch_id", "file_name", "source_row_number"),
@@ -45,8 +51,11 @@ EXPORTED_TABLES = {
     "mart.dim_patient": ("patient_key",),
     "mart.fact_encounter_version": ("version_key",),
     "mart.fact_encounter_current": ("encounter_key",),
+    "clean.version_dq_issues": ("version_key", "check_code"),
+    "ops.dq_report": ("batch_id", f"file_name{NULLS_FIRST}", "check_code"),
+    "ops.quarantine": ("batch_id", "file_name", f"source_row_number{NULLS_FIRST}", "quarantine_level"),
 }
-EXPORT_SCHEMAS = ("clean", "mart")
+EXPORT_SCHEMAS = ("clean", "mart", "ops")
 
 
 def file_name(table: str) -> str:
@@ -83,7 +92,7 @@ def export_table(con: duckdb.DuckDBPyConnection, table: str, order_by: tuple[str
     """Write one table to `path`; returns the number of rows."""
     columns = [r[0] for r in con.execute(f"DESCRIBE {table}").fetchall()]
     _check_exportable(table, columns)
-    if not set(order_by) <= set(columns):
+    if not {c.removesuffix(NULLS_FIRST) for c in order_by} <= set(columns):
         raise PipelineError(f"{table} lacks its export ordering columns")
     rows = con.execute(f"SELECT {', '.join(columns)} FROM {table} ORDER BY {', '.join(order_by)}").fetchall()
 

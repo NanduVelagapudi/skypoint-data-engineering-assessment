@@ -8,7 +8,8 @@ fail error-level DQ checks (the Task 6 publish gate). Then it rebuilds the
 PHI-free clean.encounter_patients table (Task 3), the mart tables (Task 5) and,
 in the same transaction, the DQ tables clean.version_dq_issues, ops.quarantine
 and ops.dq_report (Task 6), and exports output/batch_audit.csv and one CSV per
-PHI-free clean and mart table.
+PHI-free clean and mart table and per DQ table (version_dq_issues.csv,
+quarantine.csv, dq_report.csv).
 
 --rebuild-derived first rebuilds the Task 4 history and audit counts from the
 raw layer, replaying every accepted batch through the same step as an

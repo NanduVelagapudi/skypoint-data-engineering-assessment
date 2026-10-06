@@ -104,14 +104,17 @@ def test_q1_equals_the_independent_monthly_totals(run):
     rows = query(run["con"], "q1_monthly_volume_current.sql")
 
     assert by_month(rows) == independent_monthly_totals(run["con"])
-    assert sum(r[5] for r in rows) == 3080  # current encounters with an admit month, excluding VOID
+    # Current encounters with an admit month, excluding VOID and Task 6 ERROR versions: 3,080 before
+    # Task 6, less 30 non-VOID current versions with an unresolved facility (31, one of them VOID).
+    # The 18 with an unusable admit date never had a month.
+    assert sum(r[5] for r in rows) == 3050
 
 
 def test_q5_as_of_batch_002_equals_the_independent_totals(run):
     rows = query(run["con"], "q5_monthly_volume_as_of.sql", as_of_batch="batch_002")
 
     assert by_month(rows) == independent_monthly_totals(run["con"], "batch_002")
-    assert sum(r[5] for r in rows) == 3013
+    assert sum(r[5] for r in rows) == 2984  # 3,013 before Task 6, less 29 unresolved facilities known at batch_002
 
 
 @pytest.mark.parametrize("batch", ["batch_003", "batch_004"])
@@ -161,15 +164,46 @@ def test_q4_provider_at_encounter(run):
     }  # fmt: skip
 
 
-def test_q6_lists_the_rejected_batch_004_files(run):
+def test_q6_lists_the_rejected_batch_004_files_and_the_error_versions(run):
     rows = query(run["con"], "q6_quarantined_and_rejected.sql")
 
-    assert rows == [
-        ("FILE", "batch_004", "encounters_athena_clinics.csv", None, "SIBLING_FILE_REJECTED"),
-        ("FILE", "batch_004", "encounters_epic_north.csv", None,
+    assert len(rows) == 53
+    assert [r for r in rows if r[0] == "FILE"] == [
+        ("FILE", "BATCH_VALIDATION", "batch_004", "encounters_athena_clinics.csv", None, None, None, None,
+         "SIBLING_FILE_REJECTED", "SIBLING_FILE_REJECTED"),
+        ("FILE", "BATCH_VALIDATION", "batch_004", "encounters_epic_north.csv", None, None, None, None,
+         "MALFORMED_RECORD|ROW_COUNT_MISMATCH|SHA256_MISMATCH",
          "SHA256_MISMATCH; MALFORMED_RECORD(record=18,fields=3,expected=21); ROW_COUNT_MISMATCH(expected=22,received=18)"),
-        ("FILE", "batch_004", "encounters_legacy_meditech.csv", None, "SIBLING_FILE_REJECTED"),
-    ]  # no row was quarantined in batches 001-003
+        ("FILE", "BATCH_VALIDATION", "batch_004", "encounters_legacy_meditech.csv", None, None, None, None,
+         "SIBLING_FILE_REJECTED", "SIBLING_FILE_REJECTED"),
+    ]  # fmt: skip
+    versions = [r for r in rows if r[0] == "VERSION"]
+    assert Counter(r[2] for r in versions) == {"batch_001": 44, "batch_002": 5, "batch_003": 1}
+    assert Counter(r[8] for r in versions) == {
+        "FACILITY_UNRESOLVED": 32, "DATE_INVALID": 12, "DATE_AFTER_DELIVERY": 4, "DATE_PLACEHOLDER": 2}
+    assert Counter(r[7] for r in versions) == {True: 49, False: 1}
+    assert not [r for r in rows if r[0] == "ROW"]  # no Task 4 row quarantine in batches 001-003
+
+
+def test_dq_csvs_on_the_real_data(run):
+    output = run["output"]
+
+    def rows(name):
+        with (output / name).open(encoding="utf-8", newline="") as handle:
+            return list(csv.DictReader(handle))
+
+    issues, quarantine_rows, report = rows("version_dq_issues.csv"), rows("quarantine.csv"), rows("dq_report.csv")
+    assert len(issues) == 1219 and Counter(r["severity"] for r in issues) == {"ERROR": 50, "WARNING": 1169}
+    assert len(quarantine_rows) == 53
+    assert len(report) == 621
+    gate = [(r["batch_id"], r["observed_count"], r["observed_pct"], r["threshold_pct"], r["status"])
+            for r in report if r["check_code"] == "PUBLISH_GATE"]  # fmt: skip
+    assert gate == [
+        ("batch_001", "44", "1.54", "5.00", "PASS"),
+        ("batch_002", "5", "0.85", "5.00", "PASS"),
+        ("batch_003", "1", "0.53", "5.00", "PASS"),
+        ("batch_004", "", "", "5.00", "NOT_EVALUATED"),
+    ]
 
 
 # --- PHI scan of every exported CSV ---
