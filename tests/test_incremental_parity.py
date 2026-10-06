@@ -210,6 +210,53 @@ def provider_lookup(con) -> dict:
     return {"outcomes": dict(outcomes), "differs_from_latest": differs_from_latest, "sql_matches": sql_matches}
 
 
+FACT_TABLES = ("mart.fact_encounter_version", "mart.fact_encounter_current")
+FOREIGN_KEYS = {
+    "facility_id": ("mart.dim_facility", "facility_id"),
+    "provider_sk": ("mart.dim_provider", "provider_sk"),
+    "patient_key": ("mart.dim_patient", "patient_key"),
+    "primary_dx_code": ("mart.dim_diagnosis", "icd10_code"),
+    "payer_category": ("mart.dim_payer", "payer_category"),
+    "admit_date": ("mart.dim_date", "date_key"),
+    "discharge_date": ("mart.dim_date", "date_key"),
+}
+
+
+def fact_checks(con) -> dict:
+    """Integrity counts for the fact tables (all should be 0), and their distributions."""
+    checks = {}
+    for table in FACT_TABLES:
+        columns = [r[0] for r in con.execute(f"DESCRIBE {table}").fetchall()]
+        checks[(table, "null_without_reason")] = sum(
+            con.execute(f"SELECT count(*) FROM {table} WHERE {c} IS NULL AND {c}_reason IS NULL").fetchone()[0]
+            for c in columns if f"{c}_reason" in columns
+        )
+        for column, (dim, key) in FOREIGN_KEYS.items():
+            checks[(table, f"orphan_{column}")] = con.execute(
+                f"SELECT count(*) FROM {table} WHERE {column} IS NOT NULL AND {column} NOT IN (SELECT {key} FROM {dim})"
+            ).fetchone()[0]
+        # Lineage resolves to a raw row (the test joins raw; the mart itself never reads it).
+        checks[(table, "lineage_unresolved")] = con.execute(
+            f"SELECT count(*) FROM {table} f ANTI JOIN raw.encounters e ON e.batch_id = f.source_batch_id "
+            "AND e.file_name = f.source_file_name AND e.source_row_number = f.source_row_number"
+        ).fetchone()[0]
+    return {
+        "integrity": checks,
+        "length_of_stay_reasons": dict(con.execute(
+            "SELECT length_of_stay_days_reason, count(*) FROM mart.fact_encounter_current GROUP BY 1").fetchall()),
+        "provider_reasons": dict(con.execute(
+            "SELECT provider_sk_reason, count(*) FROM mart.fact_encounter_current GROUP BY 1").fetchall()),
+        "version_counts": dict(con.execute(
+            "SELECT version_count, count(*) FROM mart.fact_encounter_current GROUP BY 1").fetchall()),
+        "patients": dict(con.execute(
+            "SELECT patient_link_status || CASE WHEN attributes_vary THEN ', varies' ELSE '' END, count(*) "
+            "FROM mart.dim_patient GROUP BY 1").fetchall()),
+        "current_matches_view": con.execute(
+            "SELECT count(*) FROM mart.fact_encounter_current f JOIN clean.encounter_current c "
+            "USING (encounter_key, version_key)").fetchone()[0],
+    }
+
+
 def scd2_rows_from_roster_files() -> int:
     """dim_provider's row count recomputed straight from the roster CSVs: one row per unchanged stretch."""
     snapshots = []
@@ -251,6 +298,7 @@ def capture(env) -> dict:
             ).fetchone()[0],
             "dim_diagnosis_in_reference": dict(con.execute(
                 "SELECT in_reference, count(*) FROM mart.dim_diagnosis GROUP BY 1").fetchall()),
+            "facts": fact_checks(con),
         }
     finally:
         con.close()
@@ -515,3 +563,43 @@ def test_other_dimensions(runs):
     assert state["dim_diagnosis_in_reference"] == {True: 43, False: 3}
     assert state["dim_date_range"] == (date(2023, 1, 1), date(2025, 12, 31), 1096)
     assert state["dates_outside_dim_date"] == 0
+
+
+# --- mart facts and dim_patient (Task 5 group c) ---
+
+
+def test_fact_and_patient_row_counts(runs):
+    counts = runs["batch_004"]["counts"]
+
+    assert counts["mart.fact_encounter_version"] == 3541
+    assert counts["mart.fact_encounter_current"] == 3274
+    assert counts["mart.dim_patient"] == 907  # every patient_key in clean.encounter_patients
+    assert runs["batch_004"]["facts"]["current_matches_view"] == 3274
+
+
+@pytest.mark.parametrize("run", FINAL_RUNS)
+def test_fact_integrity(runs, run):
+    """Every NULL has a reason, every non-NULL foreign key exists, every row's lineage resolves to a raw row."""
+    integrity = runs[run]["facts"]["integrity"]
+
+    assert integrity and all(count == 0 for count in integrity.values()), {k: v for k, v in integrity.items() if v}
+
+
+def test_fact_distributions_match_the_profile(runs):
+    facts = runs["batch_004"]["facts"]
+
+    # Profile: 2,385 stays computed, 7 discharges before admit, 18 admit dates and 864 more
+    # discharge dates unavailable (868 missing discharges, 4 of them already lacking an admit date).
+    assert facts["length_of_stay_reasons"] == {
+        None: 2385,
+        "DISCHARGE_BEFORE_ADMIT": 7,
+        "LENGTH_OF_STAY_ADMIT_UNAVAILABLE": 18,
+        "LENGTH_OF_STAY_DISCHARGE_UNAVAILABLE": 864,
+    }
+    assert facts["provider_reasons"] == {
+        None: 3218, "NPI_NOT_IN_ROSTER": 18, "PROVIDER_ADMIT_DATE_UNKNOWN": 18,
+        "NPI_PLACEHOLDER": 2, "NPI_INVALID_FORMAT": 9, "NPI_CHECKSUM_FAILED": 4, "NPI_MISSING": 5,
+    }  # fmt: skip
+    assert facts["version_counts"] == {1: 3029, 2: 223, 3: 22}
+    # Profile: 895 LINKED and 12 UNLINKED patient keys; 1 (a linked one) varies in sex or ZIP3.
+    assert facts["patients"] == {"LINKED": 894, "LINKED, varies": 1, "UNLINKED": 12}

@@ -25,15 +25,15 @@ No row means no provider, never the latest snapshot instead:
     admit date unknown                PROVIDER_ADMIT_DATE_UNKNOWN
     no row covers the admit date      PROVIDER_NOT_ON_ROSTER_AT_ADMIT
 
-All five tables are dropped and recreated in one transaction. Their inputs are
-the reference files and, for dim_diagnosis and dim_date, the cleaned version
-fields, so the same inputs always give the same rows. No table holds patient
+All five tables are dropped and recreated inside the mart rebuild transaction
+(warehouse.rebuild_mart). Their inputs are the reference files and, for
+dim_diagnosis and dim_date, the cleaned version fields, so the same inputs
+always give the same rows. No table holds patient
 data; dim_provider holds provider names from the roster.
 """
 
 from __future__ import annotations
 
-import contextlib
 import hashlib
 import json
 import logging
@@ -41,7 +41,8 @@ from bisect import bisect_right
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
-from datetime import date
+from datetime import date, datetime
+from decimal import Decimal
 
 import duckdb
 
@@ -245,13 +246,29 @@ def _columns(con: duckdb.DuckDBPyConnection, table: str) -> list[tuple[str, str]
     return [(r[0], r[1]) for r in con.execute(f"DESCRIBE {table}").fetchall()]
 
 
-def _insert(con: duckdb.DuckDBPyConnection, table: str, rows: Sequence[Mapping[str, object]]) -> None:
-    """One JSON document per table (see raw_store), cast to the column types in SQL."""
+def _json_value(value: object) -> object:
+    if isinstance(value, datetime):  # TIMESTAMP columns hold naive UTC
+        return value.isoformat(sep=" ")
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, Decimal):  # exact text, never a float
+        return str(value)
+    return value
+
+
+def insert_rows(con: duckdb.DuckDBPyConnection, table: str, rows: Sequence[Mapping[str, object]]) -> None:
+    """Insert rows into a mart table as one JSON document (see raw_store), cast to its column types in SQL.
+
+    Every value travels as text, so DECIMAL amounts are never floats.
+    """
     if not rows:
         return
     columns = _columns(con, table)
+    expected = {name for name, _ in columns}
+    if any(set(row) != expected for row in rows):
+        raise ValueError(f"rows for {table} do not have exactly its columns")  # a typo would otherwise load as NULL
     document = json.dumps(
-        [{name: (value.isoformat() if isinstance(value, date) else value) for name, value in row.items()} for row in rows],
+        [{name: _json_value(value) for name, value in row.items()} for row in rows],
         ensure_ascii=False,
     )
     schema = json.dumps([{name: "VARCHAR" for name, _ in columns}])
@@ -292,27 +309,18 @@ def observed_unreferenced_codes(con: duckdb.DuckDBPyConnection) -> list[str]:
     ]
 
 
-def rebuild_dimensions(con: duckdb.DuckDBPyConnection, reference: WarehouseReference) -> dict[str, int]:
-    """Drop and recreate the five dimensions in one transaction; returns rows per table."""
+def write_dimensions(con: duckdb.DuckDBPyConnection, reference: WarehouseReference) -> dict[str, int]:
+    """Drop and recreate the five dimensions inside the caller's transaction; returns rows per table."""
     providers = build_provider_rows(reference.roster, (f.facility_id for f in reference.facilities))
-    con.begin()
-    try:
-        con.execute(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA}")
-        contents = {
-            PROVIDER_TABLE: [asdict(p) for p in providers],
-            FACILITY_TABLE: facility_rows(reference.facilities),
-            DIAGNOSIS_TABLE: diagnosis_rows(reference.icd10, observed_unreferenced_codes(con)),
-            PAYER_TABLE: payer_rows(),
-            DATE_TABLE: date_rows(con),
-        }
-        for table, rows in contents.items():
-            con.execute(f"CREATE OR REPLACE TABLE {table} ({_DDL[table]})")
-            _insert(con, table, rows)
-        con.commit()
-    except BaseException as exc:
-        with contextlib.suppress(duckdb.Error):
-            con.rollback()
-        log.error("dimensions_rolled_back", extra={"step": "mart", "error_type": type(exc).__name__})
-        raise
-    log.info("dimensions_built", extra={"step": "mart"})
+    con.execute(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA}")
+    contents = {
+        PROVIDER_TABLE: [asdict(p) for p in providers],
+        FACILITY_TABLE: facility_rows(reference.facilities),
+        DIAGNOSIS_TABLE: diagnosis_rows(reference.icd10, observed_unreferenced_codes(con)),
+        PAYER_TABLE: payer_rows(),
+        DATE_TABLE: date_rows(con),
+    }
+    for table, rows in contents.items():
+        con.execute(f"CREATE OR REPLACE TABLE {table} ({_DDL[table]})")
+        insert_rows(con, table, rows)
     return {table: len(rows) for table, rows in contents.items()}

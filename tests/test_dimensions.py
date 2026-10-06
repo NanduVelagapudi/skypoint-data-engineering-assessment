@@ -269,14 +269,14 @@ def test_a_failed_rebuild_keeps_the_previous_dimensions(landing_dir, pipeline_en
     write_batch(landing_dir, "batch_001", BATCH)
     main(pipeline_env)
     before = mart_counts(pipeline_env)
-    original = dimensions._insert
+    original = dimensions.insert_rows
 
     def fail_on_dates(con, table, rows):
         if table == dimensions.DATE_TABLE:
             raise RuntimeError("simulated failure while building dim_date")
         original(con, table, rows)
 
-    monkeypatch.setattr(dimensions, "_insert", fail_on_dates)
+    monkeypatch.setattr(dimensions, "insert_rows", fail_on_dates)
 
     assert main(pipeline_env) == 1
     assert mart_counts(pipeline_env) == before

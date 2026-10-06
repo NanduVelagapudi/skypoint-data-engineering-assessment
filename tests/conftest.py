@@ -188,6 +188,9 @@ STATE_TABLES = (
     "mart.dim_diagnosis",
     "mart.dim_payer",
     "mart.dim_date",
+    "mart.dim_patient",
+    "mart.fact_encounter_version",
+    "mart.fact_encounter_current",
 )
 
 
