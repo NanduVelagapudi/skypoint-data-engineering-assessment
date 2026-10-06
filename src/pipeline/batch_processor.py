@@ -4,29 +4,39 @@ For every pending batch, all validation runs in memory first: the manifest, then
 each file (SHA-256 over the raw bytes, decoding and parsing, schema contract,
 record shape, row count). Only then is the batch written, in one transaction:
 
-* every file passed: raw rows, file records and ACCEPTED audit rows;
+* every file passed: raw rows, file records, the batch's encounter history
+  (Task 4 row outcomes and new versions) and ACCEPTED audit rows carrying the
+  reconciled Task 4 counts;
 * any file failed: only REJECTED audit rows. Failed files carry their own
   reason codes; the files that passed carry SIBLING_FILE_REJECTED.
 
+The history step classifies only the batch's own rows against the history of
+the encounters they touch; nothing else is recomputed. If a file's counts do
+not reconcile, the transaction rolls back and the run fails.
+
 A rejection is a data outcome, not an error: processing continues with the next
-batch. Logs carry allow-listed keys only and never row values.
+batch. Redeliveries are flagged, never re-loaded: a file whose bytes were
+already ingested in an earlier batch is still accepted (its rows classify as
+duplicates or stale) with DUPLICATE_FILE in its audit reason, and an already
+processed batch folder whose files have changed is skipped as before, with a
+warning in the log. Logs carry allow-listed keys only and never row values.
 """
 
 from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
 import duckdb
 
-from pipeline import raw_store
-from pipeline.batch_audit import AuditRow, BatchStatus, processed_batch_ids
+from pipeline import encounter_history, raw_store
+from pipeline.batch_audit import RECONCILED, AuditRow, BatchStatus, processed_batch_ids
 from pipeline.csv_reader import parse_csv
-from pipeline.errors import BatchRejected, ReasonCode, ValidationFailure, format_reasons
+from pipeline.errors import BatchRejected, PipelineError, ReasonCode, ValidationFailure, format_reasons
 from pipeline.manifest import (
     MANIFEST_FILE_NAME,
     Manifest,
@@ -38,17 +48,25 @@ from pipeline.manifest import (
 )
 from pipeline.raw_store import AcceptedFile
 from pipeline.schema_contract import SchemaContracts, describe_mismatch, match_header
+from pipeline.source_conventions import SourceConventions
 
 log = logging.getLogger(__name__)
 
 BATCH_DIR_NAME = re.compile(r"batch_\d{3}")
+
+# Audit reason / log reason codes for redeliveries. They flag, not reject, so
+# they are not batch-rejection ReasonCodes.
+DUPLICATE_FILE = "DUPLICATE_FILE"
+BATCH_REDELIVERED_CHANGED = "BATCH_REDELIVERED_CHANGED"
+RECONCILIATION_FAILED = "RECONCILIATION_FAILED"
 
 
 @dataclass(frozen=True)
 class BatchResult:
     batch_id: str
     status: BatchStatus
-    accepted_rows: int  # raw rows written; 0 when rejected
+    accepted_rows: int  # rows that created a new encounter or version; 0 when rejected
+    received_rows: int = 0  # raw rows written; 0 when rejected
 
 
 @dataclass(frozen=True)
@@ -77,20 +95,53 @@ def list_batch_dirs(landing_dir: Path) -> list[Path]:
 
 
 def run_pending_batches(
-    con: duckdb.DuckDBPyConnection, landing_dir: Path, contracts: SchemaContracts
+    con: duckdb.DuckDBPyConnection,
+    landing_dir: Path,
+    contracts: SchemaContracts,
+    conventions: Mapping[str, SourceConventions],
 ) -> list[BatchResult]:
     """Process every batch that has no batch_audit row yet, in batch_id order."""
+    encounter_history.ensure_tables(con)
     processed = processed_batch_ids(con)
     results = []
     for batch_dir in list_batch_dirs(landing_dir):
         if batch_dir.name in processed:
             log.info("batch_already_processed", extra={"step": "discover", "batch_id": batch_dir.name})
+            _warn_if_redelivered_with_changes(con, batch_dir)
             continue
-        results.append(process_batch(con, batch_dir, contracts))
+        results.append(process_batch(con, batch_dir, contracts, conventions))
     return results
 
 
-def process_batch(con: duckdb.DuckDBPyConnection, batch_dir: Path, contracts: SchemaContracts) -> BatchResult:
+def _warn_if_redelivered_with_changes(con: duckdb.DuckDBPyConnection, batch_dir: Path) -> None:
+    """Log (never re-load) an accepted batch folder whose files differ from what was ingested.
+
+    A rejected batch stored no file hashes, so there is nothing to compare.
+    """
+    stored = dict(
+        con.execute(
+            "SELECT file_name, file_sha256 FROM raw.ingested_files WHERE batch_id = ?", [batch_dir.name]
+        ).fetchall()
+    )
+    if not stored:
+        return
+    delivered = {p.name for p in batch_dir.glob("*.csv") if p.is_file()}
+    changed = delivered != set(stored) or any(
+        sha256_hex((batch_dir / name).read_bytes()) != sha for name, sha in stored.items()
+    )
+    if changed:
+        log.warning(
+            "batch_redelivered_with_changes",
+            extra={"step": "discover", "batch_id": batch_dir.name, "reason_code": BATCH_REDELIVERED_CHANGED},
+        )
+
+
+def process_batch(
+    con: duckdb.DuckDBPyConnection,
+    batch_dir: Path,
+    contracts: SchemaContracts,
+    conventions: Mapping[str, SourceConventions],
+) -> BatchResult:
     batch_id = batch_dir.name
     start = _now()
     log.info("batch_started", extra={"step": "validate", "batch_id": batch_id})
@@ -126,11 +177,90 @@ def process_batch(con: duckdb.DuckDBPyConnection, batch_dir: Path, contracts: Sc
         return BatchResult(batch_id, BatchStatus.REJECTED, 0)
 
     files = [check.accepted for check in checks]
-    rows = [_audit_row(batch_id, check, BatchStatus.ACCEPTED, start, end) for check in checks]
-    raw_store.write_accepted_batch(con, batch_id, files, rows, ingested_at=end)
-    accepted_rows = sum(len(f.rows) for f in files)
-    _log_outcome(batch_id, BatchStatus.ACCEPTED, accepted_rows, start, end)
-    return BatchResult(batch_id, BatchStatus.ACCEPTED, accepted_rows)
+    duplicates = _duplicate_files(con, files)
+    rows = [
+        replace(_audit_row(batch_id, check, BatchStatus.ACCEPTED, start, end), reason=duplicates.get(check.entry.file_name))
+        for check in checks
+    ]
+    final_rows: list[AuditRow] = []
+
+    def add_history(con: duckdb.DuckDBPyConnection) -> list[AuditRow]:
+        """Runs inside the batch transaction, after the raw rows are written."""
+        encounter_history.apply_batch(con, batch_id, conventions)
+        counts = encounter_history.file_counts(con, batch_id)
+        final_rows[:] = [_reconciled(row, counts) for row in rows]
+        return final_rows
+
+    raw_store.write_accepted_batch(con, batch_id, files, rows, ingested_at=end, before_audit=add_history)
+    accepted_rows = sum(row.accepted_count for row in final_rows)
+    received_rows = sum(len(f.rows) for f in files)
+    _log_outcome(batch_id, BatchStatus.ACCEPTED, accepted_rows, start, end, rows=final_rows)
+    return BatchResult(batch_id, BatchStatus.ACCEPTED, accepted_rows, received_rows)
+
+
+def _duplicate_files(con: duckdb.DuckDBPyConnection, files: Sequence[AcceptedFile]) -> dict[str, str]:
+    """Audit reason for each file whose exact bytes were already ingested in an earlier batch."""
+    reasons = {}
+    for accepted in files:
+        first_batch = con.execute(
+            "SELECT min(batch_id) FROM raw.ingested_files WHERE file_sha256 = ? AND batch_id <> ?",
+            [accepted.file_sha256, accepted.batch_id],
+        ).fetchone()[0]
+        if first_batch is not None:
+            reasons[accepted.file_name] = f"{DUPLICATE_FILE}(first_batch={first_batch})"
+            log.warning(
+                "duplicate_file_delivered",
+                extra={
+                    "step": "validate",
+                    "batch_id": accepted.batch_id,
+                    "file_name": accepted.file_name,
+                    "source_system": accepted.source_system,
+                    "reason_code": DUPLICATE_FILE,
+                },
+            )
+    return reasons
+
+
+def _reconciled(row: AuditRow, counts: Mapping[str, encounter_history.FileCounts]) -> AuditRow:
+    """The accepted audit row with its Task 4 counts, or PipelineError if they do not reconcile.
+
+    Two separate checks: every received raw row has exactly one outcome, and
+    every history row written is accounted for by an outcome that creates one.
+    """
+    c = counts.get(row.file_name, encounter_history.FileCounts())
+    rows_reconcile = row.received_count == c.outcome_rows == (
+        c.new_encounter + c.new_version + c.duplicate + c.stale + c.quarantined
+    )
+    history_reconciles = c.history_rows_written == c.new_encounter + c.new_version + c.stale_new_version
+    if not (rows_reconcile and history_reconciles):
+        log.error(
+            "reconciliation_failed",
+            extra={
+                "step": "history",
+                "batch_id": row.batch_id,
+                "file_name": row.file_name,
+                "received_count": row.received_count,
+                "accepted_count": c.accepted,
+                "duplicate_count": c.duplicate,
+                "stale_count": c.stale,
+                "quarantined_count": c.quarantined,
+                "reason_code": RECONCILIATION_FAILED,
+            },
+        )
+        raise PipelineError(f"Task 4 counts do not reconcile for {row.batch_id}/{row.file_name}")
+    return replace(
+        row,
+        accepted_count=c.accepted,
+        new_encounter_count=c.new_encounter,
+        new_version_count=c.new_version,
+        duplicate_count=c.duplicate,
+        stale_count=c.stale,
+        stale_new_version_count=c.stale_new_version,
+        quarantined_count=c.quarantined,
+        history_rows_written=c.history_rows_written,
+        current_changed_count=c.current_changed,
+        reconciliation_status=RECONCILED,
+    )
 
 
 def _check_file(
@@ -216,6 +346,7 @@ def _log_outcome(
     start: datetime,
     end: datetime,
     reason_code: str | None = None,
+    rows: Sequence[AuditRow] = (),
 ) -> None:
     extra = {
         "step": "store",
@@ -224,6 +355,9 @@ def _log_outcome(
         "accepted_count": accepted_rows,
         "duration_ms": round((end - start).total_seconds() * 1000),
     }
+    if rows:  # accepted: the batch totals of the reconciled audit rows
+        for key in ("received_count", "duplicate_count", "stale_count", "quarantined_count"):
+            extra[key] = sum(getattr(row, key) for row in rows)
     if reason_code:
         extra["reason_code"] = reason_code
     level = logging.INFO if status == BatchStatus.ACCEPTED else logging.WARNING

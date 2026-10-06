@@ -533,6 +533,74 @@ def write_classified_batch(con: duckdb.DuckDBPyConnection, classified: Classifie
     _insert_json(con, VERSIONS_TABLE, _VERSION_COLUMNS, classified.versions)
 
 
+@dataclass(frozen=True)
+class FileCounts:
+    """One file's Task 4 counts, read back from the stored outcome and version rows."""
+
+    outcome_rows: int = 0
+    new_encounter: int = 0
+    new_version: int = 0
+    duplicate: int = 0
+    stale: int = 0
+    stale_new_version: int = 0
+    quarantined: int = 0
+    history_rows_written: int = 0  # versions whose first-seen row is in this file
+    current_changed: int = 0  # encounters whose current version is now a row of this file
+
+    @property
+    def accepted(self) -> int:
+        return self.new_encounter + self.new_version
+
+
+def file_counts(con: duckdb.DuckDBPyConnection, batch_id: str) -> dict[str, FileCounts]:
+    """Task 4 counts per file of one batch, from what was written to the history tables.
+
+    Only NEW_ENCOUNTER and NEW_VERSION can change an encounter's current version
+    (a STALE version is never current), and every such version is newer than
+    the one held before the batch, so current_changed counts their encounters.
+    """
+    outcomes = con.execute(
+        f"""
+        SELECT file_name,
+               count(*),
+               count(*) FILTER (WHERE outcome = '{Outcome.NEW_ENCOUNTER}'),
+               count(*) FILTER (WHERE outcome = '{Outcome.NEW_VERSION}'),
+               count(*) FILTER (WHERE outcome = '{Outcome.DUPLICATE}'),
+               count(*) FILTER (WHERE outcome = '{Outcome.STALE}'),
+               count(*) FILTER (WHERE outcome_reason = '{OutcomeReason.STALE_NEW_VERSION}'),
+               count(*) FILTER (WHERE outcome = '{Outcome.QUARANTINED}'),
+               count(DISTINCT encounter_key) FILTER (WHERE outcome IN ('{Outcome.NEW_ENCOUNTER}', '{Outcome.NEW_VERSION}'))
+        FROM {OUTCOMES_TABLE}
+        WHERE batch_id = ?
+        GROUP BY file_name
+        """,
+        [batch_id],
+    ).fetchall()
+    written = dict(
+        con.execute(
+            f"SELECT first_seen_file_name, count(*) FROM {VERSIONS_TABLE} "
+            "WHERE first_seen_batch_id = ? GROUP BY first_seen_file_name",
+            [batch_id],
+        ).fetchall()
+    )
+    counts = {}
+    for file_name, rows, new_enc, new_ver, dup, stale, stale_new, quarantined, changed in outcomes:
+        counts[file_name] = FileCounts(
+            outcome_rows=rows,
+            new_encounter=new_enc,
+            new_version=new_ver,
+            duplicate=dup,
+            stale=stale,
+            stale_new_version=stale_new,
+            quarantined=quarantined,
+            history_rows_written=written.pop(file_name, 0),
+            current_changed=changed,
+        )
+    for file_name, versions in written.items():  # versions without outcome rows: cannot reconcile
+        counts[file_name] = FileCounts(history_rows_written=versions)
+    return counts
+
+
 def apply_batch(
     con: duckdb.DuckDBPyConnection, batch_id: str, conventions: Mapping[str, SourceConventions]
 ) -> ClassifiedBatch:

@@ -86,13 +86,22 @@ def test_batches_001_to_003_accepted_and_batch_004_rejected(run):
     result = audit(run["con"])
     expected = manifest_counts()
 
+    not_versioned = {
+        (b, f): n
+        for b, f, n in run["con"].execute(
+            "SELECT batch_id, file_name, duplicate_count + stale_count + quarantined_count FROM ops.batch_audit"
+        ).fetchall()
+    }
+
     assert sorted(result) == sorted(expected)
     for (batch_id, file_name), (status, reason, exp, received, accepted) in result.items():
         if batch_id == "batch_004":
             assert status == "REJECTED"
         else:
             assert (status, reason) == ("ACCEPTED", None)
-            assert exp == received == accepted == expected[(batch_id, file_name)]
+            assert exp == received == expected[(batch_id, file_name)]
+            # accepted_count is rows that created a new encounter or version (Task 4)
+            assert accepted == received - not_versioned[(batch_id, file_name)]
 
 
 def test_batch_004_reasons(run):

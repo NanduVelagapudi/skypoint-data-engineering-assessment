@@ -1,6 +1,7 @@
 """Single entry point: python -m pipeline.main
 
-Processes every pending landing batch in order, rebuilds the PHI-free
+Processes every pending landing batch in order (each accepted batch also adds
+its rows to the encounter history, Task 4), rebuilds the PHI-free
 clean.encounter_patients table (Task 3), then exports output/batch_audit.csv.
 
 Exit codes:
@@ -41,7 +42,7 @@ def run(settings: Settings, secret: bytes) -> list[BatchResult]:
 
     con = open_store(settings.raw_db_path, contracts.canonical_columns)
     try:
-        results = run_pending_batches(con, settings.landing_dir, contracts)
+        results = run_pending_batches(con, settings.landing_dir, contracts, conventions)
         build_encounter_patients(con, conventions, secret)
         export_csv(con, settings.output_dir / AUDIT_CSV_NAME)
     finally:
@@ -71,6 +72,7 @@ def main(env: Mapping[str, str] | None = None) -> int:
         extra={
             "step": "finish",
             "status": "COMPLETED_WITH_REJECTIONS" if rejected else "COMPLETED",
+            "received_count": sum(r.received_rows for r in results),
             "accepted_count": sum(r.accepted_rows for r in results),
         },
     )

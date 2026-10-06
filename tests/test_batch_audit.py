@@ -1,6 +1,7 @@
 """Batch audit tests. Each test gets its own DuckDB file and output folder under tmp_path."""
 
 import csv
+import dataclasses
 import os
 from datetime import UTC, datetime, timedelta, timezone
 
@@ -47,6 +48,26 @@ def audit_row(batch_id, file_name, status=BatchStatus.ACCEPTED, reason=None, cou
     )
 
 
+TASK4_COLUMNS = AUDIT_COLUMNS[AUDIT_COLUMNS.index("new_encounter_count") : AUDIT_COLUMNS.index("status")]
+
+
+def with_history(row):
+    """An accepted row of 3 received rows: 2 new encounters and 1 duplicate."""
+    return dataclasses.replace(
+        row,
+        accepted_count=2,
+        new_encounter_count=2,
+        new_version_count=0,
+        duplicate_count=1,
+        stale_count=0,
+        stale_new_version_count=0,
+        quarantined_count=0,
+        history_rows_written=2,
+        current_changed_count=2,
+        reconciliation_status="RECONCILED",
+    )
+
+
 def read_csv(path):
     with path.open(encoding="utf-8", newline="") as handle:
         return list(csv.reader(handle))
@@ -65,12 +86,16 @@ def test_pending_batches_are_those_without_audit_rows(store):
     assert processed_batch_ids(store) == {"batch_001", "batch_004"}
 
 
-def test_stage1_duplicate_stale_and_quarantined_counts_are_null(store):
-    write_accepted_batch(store, "batch_001", [], [audit_row("batch_001", "a.csv")], START)
+def test_task4_counts_are_stored_for_accepted_and_null_for_rejected(store):
+    write_accepted_batch(store, "batch_001", [], [with_history(audit_row("batch_001", "a.csv"))], START)
+    write_rejected_batch(store, "batch_004", [audit_row("batch_004", "a.csv", BatchStatus.REJECTED, "SHA256_MISMATCH")])
 
-    assert store.execute(
-        "SELECT duplicate_count, stale_count, quarantined_count FROM ops.batch_audit"
-    ).fetchone() == (None, None, None)
+    columns = ", ".join(TASK4_COLUMNS)
+    rows = dict(
+        (r[0], r[1:]) for r in store.execute(f"SELECT batch_id, {columns} FROM ops.batch_audit").fetchall()
+    )
+    assert rows["batch_001"] == (2, 0, 1, 0, 0, 0, 2, 2, "RECONCILED")
+    assert rows["batch_004"] == (None,) * len(TASK4_COLUMNS)
 
 
 def test_one_audit_row_per_batch_and_file(store):
@@ -103,7 +128,9 @@ def test_export_is_sorted_with_blank_nulls_and_utc_timestamps(store, tmp_path):
             audit_row("batch_004", "encounters_epic_north.csv", BatchStatus.REJECTED, "SHA256_MISMATCH"),
         ],
     )
-    write_accepted_batch(store, "batch_001", [], [audit_row("batch_001", "encounters_epic_north.csv")], START)
+    write_accepted_batch(
+        store, "batch_001", [], [with_history(audit_row("batch_001", "encounters_epic_north.csv"))], START
+    )
     path = tmp_path / "output" / "batch_audit.csv"
 
     export_csv(store, path)
@@ -117,7 +144,10 @@ def test_export_is_sorted_with_blank_nulls_and_utc_timestamps(store, tmp_path):
     ]
     first = dict(zip(header, rows[0]))
     assert first["status"] == "ACCEPTED" and first["reason"] == ""
-    assert (first["duplicate_count"], first["stale_count"], first["quarantined_count"]) == ("", "", "")
+    assert (first["duplicate_count"], first["stale_count"], first["quarantined_count"]) == ("1", "0", "0")
+    assert first["reconciliation_status"] == "RECONCILED"
+    rejected = dict(zip(header, rows[1]))
+    assert [rejected[c] for c in TASK4_COLUMNS] == [""] * len(TASK4_COLUMNS)  # not evaluated
     assert (first["start_time"], first["end_time"]) == ("2026-10-05T09:00:00.250Z", "2026-10-05T09:00:02.250Z")
     assert dict(zip(header, rows[1]))["reason"] == "SHA256_MISMATCH"
     assert dict(zip(header, rows[1]))["accepted_count"] == "0"

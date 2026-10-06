@@ -16,7 +16,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -137,8 +137,16 @@ def write_accepted_batch(
     files: Sequence[AcceptedFile],
     audit_rows: Sequence[batch_audit.AuditRow],
     ingested_at: datetime,
+    before_audit: Callable[[duckdb.DuckDBPyConnection], Sequence[batch_audit.AuditRow]] | None = None,
 ) -> None:
-    """Raw rows, file records and audit rows of one accepted batch, in one transaction."""
+    """Raw rows, file records and audit rows of one accepted batch, in one transaction.
+
+    `before_audit`, if given, runs in the same transaction after the raw rows
+    and file records are written, and returns the audit rows to insert instead
+    of `audit_rows`. The batch processor uses it to classify the batch into the
+    encounter history and fill in the Task 4 counts. If it raises, the whole
+    batch rolls back.
+    """
     if any(f.batch_id != batch_id for f in files) or any(r.batch_id != batch_id for r in audit_rows):
         raise ValueError("all files and audit rows must belong to the batch being written")
     stamp = batch_audit.db_timestamp(ingested_at)
@@ -160,6 +168,10 @@ def write_accepted_batch(
                     stamp,
                 ],
             )
+        if before_audit is not None:
+            audit_rows = before_audit(con)
+            if any(r.batch_id != batch_id for r in audit_rows):
+                raise ValueError("all audit rows must belong to the batch being written")
         batch_audit.insert_audit_rows(con, audit_rows)
 
 
