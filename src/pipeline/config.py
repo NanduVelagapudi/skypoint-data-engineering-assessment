@@ -30,6 +30,7 @@ class Settings:
     schema_contract_path: Path
     log_level: str
     reference_dir: Path
+    facility_aliases_path: Path
     # Never shown in repr, so printing or logging Settings cannot leak it.
     patient_key_secret: str | None = field(default=None, repr=False)
 
@@ -65,6 +66,7 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
         ),
         log_level=env.get("LOG_LEVEL", "INFO").strip().upper() or "INFO",
         reference_dir=_path(env, "REFERENCE_DIR", data_dir / "reference"),
+        facility_aliases_path=_path(env, "FACILITY_ALIASES_PATH", REPO_ROOT / "config" / "facility_aliases.json"),
         patient_key_secret=env.get("PATIENT_KEY_HMAC_SECRET"),
     )
 

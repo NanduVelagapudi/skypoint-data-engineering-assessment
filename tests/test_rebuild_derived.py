@@ -184,9 +184,9 @@ def test_rebuild_replays_the_incremental_step_in_batch_order(landing_dir, pipeli
     calls = []
     original = batch_processor._classify_into_history
 
-    def record(con, batch_id, rows, conventions):
+    def record(con, batch_id, *args):
         calls.append(batch_id)
-        return original(con, batch_id, rows, conventions)
+        return original(con, batch_id, *args)
 
     monkeypatch.setattr(batch_processor, "_classify_into_history", record)
 

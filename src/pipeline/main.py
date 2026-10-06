@@ -1,7 +1,8 @@
 """Single entry point: python -m pipeline.main [--rebuild-derived]
 
 Processes every pending landing batch in order (each accepted batch also adds
-its rows to the encounter history, Task 4), rebuilds the PHI-free
+its rows to the encounter history, Task 4, and the cleaned Task 2 fields of its
+new versions to clean.encounter_version_fields), rebuilds the PHI-free
 clean.encounter_patients table (Task 3), then exports output/batch_audit.csv.
 
 --rebuild-derived first rebuilds the Task 4 history and audit counts from the
@@ -32,6 +33,7 @@ from pipeline.config import Settings, load_settings, require_patient_key_secret
 from pipeline.errors import PipelineError
 from pipeline.logging_setup import configure_logging
 from pipeline.raw_store import open_store
+from pipeline.reference_data import load_cleaning_reference
 from pipeline.schema_contract import load_contracts
 from pipeline.source_conventions import load_source_conventions
 
@@ -55,14 +57,15 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
 def run(settings: Settings, secret: bytes, rebuild_derived_state: bool = False) -> list[BatchResult]:
     contracts = load_contracts(settings.schema_contract_path)
     conventions = load_source_conventions(settings.reference_dir / "source_systems_and_facilities.json")
+    reference = load_cleaning_reference(settings.reference_dir, settings.facility_aliases_path)
     if not settings.landing_dir.is_dir():
         raise PipelineError("landing folder not found")
 
     con = open_store(settings.raw_db_path, contracts.canonical_columns, allow_outdated_audit=rebuild_derived_state)
     try:
         if rebuild_derived_state:
-            rebuild_derived(con, conventions)
-        results = run_pending_batches(con, settings.landing_dir, contracts, conventions)
+            rebuild_derived(con, conventions, reference)
+        results = run_pending_batches(con, settings.landing_dir, contracts, conventions, reference)
         build_encounter_patients(con, conventions, secret)
         export_csv(con, settings.output_dir / AUDIT_CSV_NAME)
     finally:

@@ -37,7 +37,7 @@ from pathlib import Path
 
 import duckdb
 
-from pipeline import batch_audit, encounter_history, raw_store
+from pipeline import batch_audit, encounter_history, raw_store, version_fields
 from pipeline.batch_audit import RECONCILED, AuditRow, BatchStatus, processed_batch_ids
 from pipeline.csv_reader import parse_csv
 from pipeline.errors import BatchRejected, PipelineError, ReasonCode, ValidationFailure, format_reasons
@@ -51,6 +51,7 @@ from pipeline.manifest import (
     sha256_hex,
 )
 from pipeline.raw_store import AcceptedFile
+from pipeline.reference_data import CleaningReference
 from pipeline.schema_contract import SchemaContracts, describe_mismatch, match_header
 from pipeline.source_conventions import SourceConventions
 
@@ -103,9 +104,19 @@ def run_pending_batches(
     landing_dir: Path,
     contracts: SchemaContracts,
     conventions: Mapping[str, SourceConventions],
+    reference: CleaningReference,
 ) -> list[BatchResult]:
-    """Process every batch that has no batch_audit row yet, in batch_id order."""
+    """Process every batch that has no batch_audit row yet, in batch_id order.
+
+    Refuses a database whose history has versions without cleaned fields (one
+    from before clean.encounter_version_fields existed): --rebuild-derived fills them.
+    """
     encounter_history.ensure_tables(con)
+    version_fields.ensure_table(con)
+    if version_fields.missing_count(con):
+        raise PipelineError(
+            "encounter versions without cleaned fields; run python -m pipeline.main --rebuild-derived"
+        )
     processed = processed_batch_ids(con)
     results = []
     for batch_dir in list_batch_dirs(landing_dir):
@@ -113,7 +124,7 @@ def run_pending_batches(
             log.info("batch_already_processed", extra={"step": "discover", "batch_id": batch_dir.name})
             _warn_if_redelivered_with_changes(con, batch_dir)
             continue
-        results.append(process_batch(con, batch_dir, contracts, conventions))
+        results.append(process_batch(con, batch_dir, contracts, conventions, reference))
     return results
 
 
@@ -145,6 +156,7 @@ def process_batch(
     batch_dir: Path,
     contracts: SchemaContracts,
     conventions: Mapping[str, SourceConventions],
+    reference: CleaningReference,
 ) -> BatchResult:
     batch_id = batch_dir.name
     start = _now()
@@ -190,7 +202,7 @@ def process_batch(
 
     def add_history(con: duckdb.DuckDBPyConnection) -> list[AuditRow]:
         """Runs inside the batch transaction, after the raw rows are written."""
-        final_rows[:] = _classify_into_history(con, batch_id, rows, conventions)
+        final_rows[:] = _classify_into_history(con, batch_id, rows, conventions, reference)
         return final_rows
 
     raw_store.write_accepted_batch(con, batch_id, files, rows, ingested_at=end, before_audit=add_history)
@@ -205,27 +217,38 @@ def _classify_into_history(
     batch_id: str,
     rows: Sequence[AuditRow],
     conventions: Mapping[str, SourceConventions],
+    reference: CleaningReference,
 ) -> list[AuditRow]:
     """Classify an accepted batch already in raw into the history; return its reconciled audit rows.
 
-    The one Task 4 step for a batch, inside the caller's transaction: used by
-    the incremental load and, batch by batch, by rebuild_derived.
+    The one history step for a batch, inside the caller's transaction: used by
+    the incremental load and, batch by batch, by rebuild_derived. It adds the
+    batch's row outcomes and new versions, then the cleaned fields of those
+    new versions (insert-only).
     """
     encounter_history.apply_batch(con, batch_id, conventions)
+    version_fields.add_batch_fields(con, batch_id, conventions, reference)
+    if version_fields.missing_count(con, batch_id):
+        raise PipelineError(f"cleaned fields are missing for versions of {batch_id}")
     counts = encounter_history.file_counts(con, batch_id)
     return [_reconciled(row, counts) for row in rows]
 
 
-def rebuild_derived(con: duckdb.DuckDBPyConnection, conventions: Mapping[str, SourceConventions]) -> list[str]:
-    """Rebuild the Task 4 history and audit counts from raw; returns the batch ids replayed.
+def rebuild_derived(
+    con: duckdb.DuckDBPyConnection,
+    conventions: Mapping[str, SourceConventions],
+    reference: CleaningReference,
+) -> list[str]:
+    """Rebuild the history, cleaned fields and Task 4 audit counts from raw; returns the batch ids replayed.
 
     In one transaction: migrate a pre-Task-4 ops.batch_audit if needed, empty
-    the history tables, then replay every accepted batch in batch_id order
-    through _classify_into_history, the same step an incremental load runs,
-    and overwrite the batch's accepted_count and Task 4 audit columns. Raw
-    rows, file records and every other audit value (status, reason, timings)
-    are left as they are. If anything fails, everything rolls back, so a
-    pre-Task-4 database stays pre-Task-4 and is still refused by normal runs.
+    the history and cleaned-field tables, then replay every accepted batch in
+    batch_id order through _classify_into_history, the same step an
+    incremental load runs, and overwrite the batch's accepted_count and Task 4
+    audit columns. Raw rows, file records and every other audit value (status,
+    reason, timings) are left as they are. If anything fails, everything rolls
+    back, so a pre-Task-4 database stays pre-Task-4 and is still refused by
+    normal runs.
     """
     log.info("derived_rebuild_started", extra={"step": "rebuild"})
     con.begin()
@@ -234,14 +257,16 @@ def rebuild_derived(con: duckdb.DuckDBPyConnection, conventions: Mapping[str, So
             batch_audit.migrate_audit_table(con)
             log.warning("batch_audit_migrated", extra={"step": "rebuild"})
         encounter_history.ensure_tables(con)
+        version_fields.ensure_table(con)
         encounter_history.clear_history(con)
+        version_fields.clear(con)
         batch_ids = [r[0] for r in con.execute("SELECT DISTINCT batch_id FROM raw.ingested_files ORDER BY batch_id").fetchall()]
         for batch_id in batch_ids:
             rows = batch_audit.read_audit_rows(con, batch_id)
             ingested = {r[0] for r in con.execute("SELECT file_name FROM raw.ingested_files WHERE batch_id = ?", [batch_id]).fetchall()}
             if {r.file_name for r in rows} != ingested or any(r.status != BatchStatus.ACCEPTED for r in rows):
                 raise PipelineError(f"audit rows of {batch_id} do not match its ingested files")
-            batch_audit.update_task4_counts(con, _classify_into_history(con, batch_id, rows, conventions))
+            batch_audit.update_task4_counts(con, _classify_into_history(con, batch_id, rows, conventions, reference))
         con.commit()
     except BaseException as exc:
         with contextlib.suppress(duckdb.Error):  # a failed commit may already have rolled back

@@ -40,6 +40,7 @@ from conftest import (
     state_digest,
 )
 
+from pipeline import version_fields
 from pipeline.batch_audit import AUDIT_COLUMNS, TASK4_COLUMNS
 from pipeline.main import main
 from pipeline.parsers.amount import parse_amount
@@ -159,6 +160,28 @@ def read_audit_csv(env, *, drop_run_times: bool) -> list[dict]:
     return rows
 
 
+FLAG_COLUMNS = tuple(c for c in version_fields.FIELD_COLUMNS if c.endswith(("_reason", "_warning")))
+CLEANED_COLUMNS = tuple(c.removesuffix("_reason") for c in version_fields.FIELD_COLUMNS if c.endswith("_reason"))
+
+
+def field_flags(con) -> dict[str, dict[tuple[str, str], int]]:
+    """Counts of every reason and warning in the cleaned fields, for current and superseded versions."""
+    flags = {"current": {}, "superseded": {}}
+    for column in FLAG_COLUMNS:
+        for is_current, value, count in con.execute(
+            f"SELECT c.version_key IS NOT NULL, f.{column}, count(*) FROM {version_fields.TABLE} f "
+            f"LEFT JOIN clean.encounter_current c USING (version_key) WHERE f.{column} IS NOT NULL GROUP BY ALL"
+        ).fetchall():
+            flags["current" if is_current else "superseded"][(column, value)] = count
+    return flags
+
+
+def null_without_reason(con) -> int:
+    """Rows where a cleaned value is NULL without a reason, or has a reason but is not NULL."""
+    checks = " + ".join(f"count(*) FILTER (WHERE ({c} IS NULL) <> ({c}_reason IS NOT NULL))" for c in CLEANED_COLUMNS)
+    return con.execute(f"SELECT {checks} FROM {version_fields.TABLE}").fetchone()[0]
+
+
 def capture(env) -> dict:
     db = Path(env["RAW_DB_PATH"])
     con = attach(db)
@@ -169,6 +192,8 @@ def capture(env) -> dict:
             "current_totals": monthly_totals(con),
             "asof_002_totals": monthly_totals(con, "batch_002"),
             "late_update_months": late_update_months(con),
+            "field_flags": field_flags(con),
+            "null_without_reason": null_without_reason(con),
         }
     finally:
         con.close()
@@ -337,3 +362,55 @@ def test_late_updates_change_historical_months_but_not_the_as_of_state(runs):
     assert late and late <= set(after_002["current_totals"])
     assert changed & late
     assert max(late) < (2025, 1)  # batch_003 was delivered 2025-01-20
+
+
+# --- cleaned version fields (Task 5 group a) ---
+
+# Every reason and warning on current versions, as counted in the Task 5 design profile.
+APPROVED_CURRENT_FLAGS = {
+    ("facility_id_reason", "FACILITY_UNRESOLVED"): 31,
+    ("admit_date_reason", "DATE_INVALID"): 12,
+    ("admit_date_reason", "DATE_AFTER_DELIVERY"): 4,
+    ("admit_date_reason", "DATE_PLACEHOLDER"): 2,
+    ("discharge_date_reason", "DATE_MISSING"): 868,
+    ("discharge_date_warning", "DISCHARGE_BEFORE_ADMIT"): 7,
+    ("encounter_type_warning", "ENCOUNTER_TYPE_MISSING"): 18,
+    ("payer_category_warning", "PAYER_MISSING"): 12,
+    ("primary_dx_code_reason", "DX_ICD9"): 14,
+    ("primary_dx_code_reason", "DX_UNPARSEABLE"): 10,
+    ("primary_dx_code_reason", "DX_PLACEHOLDER"): 2,
+    ("primary_dx_code_warning", "DX_NOT_IN_REFERENCE"): 18,
+    ("attending_npi_reason", "NPI_PLACEHOLDER"): 2,
+    ("attending_npi_reason", "NPI_INVALID_FORMAT"): 9,
+    ("attending_npi_reason", "NPI_CHECKSUM_FAILED"): 4,
+    ("attending_npi_reason", "NPI_MISSING"): 5,
+    ("attending_npi_warning", "NPI_NOT_IN_ROSTER"): 18,
+    ("billed_amount_usd_reason", "AMOUNT_PLACEHOLDER"): 21,
+    ("billed_amount_usd_reason", "AMOUNT_MISSING"): 14,
+    ("billed_amount_usd_reason", "AMOUNT_SPREADSHEET_ERROR"): 8,
+    ("billed_amount_usd_reason", "AMOUNT_UNPARSEABLE"): 12,
+}
+# Superseded versions: the profile found 59 missing discharge dates and 1 unresolved facility and
+# no other reason. Their warnings (NPI roster, discharge before admit) were first counted here: none.
+APPROVED_SUPERSEDED_FLAGS = {
+    ("discharge_date_reason", "DATE_MISSING"): 59,
+    ("facility_id_reason", "FACILITY_UNRESOLVED"): 1,
+}
+
+
+def test_one_fields_row_per_version(runs):
+    counts = runs["batch_004"]["counts"]
+
+    assert counts["clean.encounter_version_fields"] == counts["clean.encounter_versions"] == 3541
+
+
+def test_approved_field_reasons_and_warnings(runs):
+    flags = runs["batch_004"]["field_flags"]
+
+    assert flags["current"] == APPROVED_CURRENT_FLAGS
+    assert flags["superseded"] == APPROVED_SUPERSEDED_FLAGS
+
+
+def test_every_null_cleaned_value_has_a_reason(runs):
+    for run in FINAL_RUNS:
+        assert runs[run]["null_without_reason"] == 0, run
