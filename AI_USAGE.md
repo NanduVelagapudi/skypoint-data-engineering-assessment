@@ -146,3 +146,40 @@
 ### Choices still open for my review
 - The cleaned table: its name, grain and columns; rebuilding it in full on each run; and keeping it in the same DuckDB file under a separate `clean` schema.
 - `PATIENT_UNLINKED_CONFLICT` for an identity whose rows disagree, no key for a blank MRN, ZIP+4 accepted for ZIP3, and the new `REFERENCE_DIR` setting.
+
+## Task 4: incremental processing and history
+
+### How I ran it
+- First a read-only design review: no repository changes, profiling allowed only in a scratch DuckDB outside the repository. Then implementation in groups, in manual-approval mode, with a pause after each group. Group (a) is the classifier, the history tables, the current-state view and their tests.
+
+### Where it saved time
+- Profiled batches 001–003 by loading copies through the pipeline's own batch processor and parsers into a scratch database. It printed counts and `source_record_id` values only. Findings:
+  - **Volumes:** 3,274 encounters and 3,541 distinct versions.
+  - **Duplicates:** 30 within batch_001, and 40 in batch_002 duplicating the then-current version.
+  - **Stale rows:** 25 in batch_003, all replays of a batch_001 version that batch_002 had superseded.
+  - **Two in-batch patterns:**
+    - Nine Athena batch_003 replays differ from the held version only in timestamp format and the new `encounter_source` column, so comparing raw text would miss them.
+    - Three batch_002 encounters have their new version before a re-sent copy of the current version in the file, so processing rows in file order would wrongly mark the copy as stale.
+  - **Ordering by text would be wrong:** 20 Meditech encounters sort differently as day-first text, and ignoring Athena v2's offset would change 8 encounters' current version.
+- Simulated the two possible classification orders before I chose one. Checking duplicate first gives 86 duplicates and 9 stale rows; checking stale first gives 70 and 25. The modelled state is the same either way; only the audit labels differ. The same simulation showed that history built batch by batch equals history built from the whole set of rows at once.
+- Ran the finished classifier on a scratch copy of the real batches. Every per-file count matched the approved design table: 3,541 versions and 3,274 current encounters. The test that proves incremental and rebuild runs give identical results comes in group (c).
+
+### Decisions I made, not the AI
+- Stale is checked before duplicate. A version is `(source_system, source_record_id, UTC last_updated_ts)`, with a fingerprint guard and the absent-column rule.
+- A never-held older version goes to history but never becomes current. The newest version stays current even when it is quarantined; it is flagged and kept out of analytics.
+- A same-timestamp conflict is quarantined and the first arrival kept. The current version's lineage points to its first arrival.
+- `accepted_count` means rows that created a version. There is a rebuild-from-raw path. A duplicate file or a redelivered `batch_id` is flagged only in the audit reason and the logs. There is no late-arrival class, history holds only the version spine, and `encounter_patients` stays a full rebuild.
+- Task 4 quarantine covers only rows that cannot be placed in version order. Task 6 data-quality failures will be a flag on the version, not an outcome.
+
+### AI choices I reviewed
+- **Python classifier instead of SQL.** Its design review proposed classifying in SQL. When implementing, it wrote the classifier as a pure Python function instead and flagged the change itself. Its reasons: the function can be unit-tested and permutation-tested, and timestamp parsing is already in Python. SQL still loads only the touched encounters' history and writes the results. I accepted this and had the trade-off and the production design (set-based classification and an insert-only `MERGE` on `version_key`) written up in ARCHITECTURE.md.
+
+### Corrections
+- **Two wrong test expectations.** One of its storage tests expected `STALE` for a re-sent copy of the version that was current before the batch. Under the approved rule (compare with the state before the batch), that row is a `DUPLICATE`. Another assumed the wrong file row for an encounter's first arrival. Both were test errors, and it fixed the tests, not the code.
+- **A profiling script crashed** (`TypeError`) on its first run because of a convoluted branch in the duplicate-first simulation. It simplified the branch and reran it. Nothing was written to the repository.
+
+### Choices resolved after review
+Claude Code raised these three points after group (a). I approved its proposal for each:
+- Same-timestamp conflicts (`VERSION_CONFLICT_SAME_TS`) count in `quarantined_count`, so that received = accepted + duplicate + stale + quarantined still holds.
+- `accepted_count` excludes stale rows that create a history version. They are counted as stale, and `history_rows_written` reconciles the difference.
+- A stale replay whose values differ from the held version stays `STALE`, with `match_type = CONFLICT`, because the stale check runs first.
