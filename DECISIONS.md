@@ -516,6 +516,169 @@ whether it is an implementation choice still open for review.
   `DATA_DIR/reference`. The cleaning stage needs the source conventions to
   parse DOB and admit dates. *(Open for review.)*
 
+## Task 4: incremental processing and history
+
+All entries below were approved in design review. Counts are for batches
+001–003.
+
+### Identity and classification
+- **A version is `(source_system, source_record_id, last_updated_ts)`, with
+  the timestamp compared as a UTC instant.**
+  - Why the timestamp is compared as an instant: compared as text, 20 Meditech
+    encounters (day-first dates) would sort wrongly, and ignoring Athena v2's
+    offset would change the current version of 8 encounters.
+  - Why `source_system` is part of the key: 26 `source_record_id` values occur
+    in more than one system.
+  - `encounter_key` and `version_key` are SHA-256 over canonical JSON, so the
+    same input always gives the same key, whatever the run or order.
+- **A fingerprint guard compares rows of the same version.**
+  - EXACT means byte-identical.
+  - EQUIVALENT means equal apart from the timestamp text and columns that are
+    NULL because one row's schema version lacks them. An empty string was
+    delivered, so it is compared.
+  - CONFLICT means any other difference.
+  - Why: comparing raw text would miss the 9 Athena batch_003 replays, which
+    differ only in timestamp format and the new `encounter_source` column. Of
+    the 92 version ids with more than one row, 83 are EXACT, 9 EQUIVALENT and
+    0 CONFLICT.
+- **Stale is checked before duplicate.** The order is: unplaceable
+  (QUARANTINED), then older than the held current version (STALE), then
+  already known (DUPLICATE, or a conflict), then new.
+  - Each row is compared with the state at the end of the previous batch, and
+    with earlier rows of its own batch in `(file_name, source_row_number)`
+    order.
+  - Why: a replay of a superseded version is stale by the brief's own
+    wording. Checking duplicate first would count 16 byte-identical replays as
+    duplicates but the 9 equivalent Athena replays as stale, an artefact of
+    formatting.
+  - Result: 70 duplicates and 25 stale, against 86 and 9 with duplicate first.
+    The modelled state is the same either way.
+- **A stale row with a never-held older version goes to history but is never
+  current** (`STALE_NEW_VERSION`).
+  - Why: the brief asks to keep every distinct version and forbids an older
+    row from overwriting a newer one; this does both.
+  - It also keeps history a function of the set of raw rows, independent of
+    arrival order. No such row occurs in the data, so it is covered by
+    synthetic tests.
+- **A stale replay whose values differ stays STALE** with
+  `match_type = CONFLICT`. It is not quarantined, because the stale check
+  runs first and the row cannot affect the current state.
+- **A same-timestamp conflict is quarantined** (`VERSION_CONFLICT_SAME_TS`),
+  and the first arrival is kept.
+  - Why: two different values for one version cannot both be right, and
+    neither may silently replace the other.
+  - It counts in `quarantined_count`, alongside rows with no
+    `source_record_id` or an unparseable timestamp. None occurs in the data.
+
+### History and current state
+- **History is insert-only.** `clean.encounter_versions` holds the version
+  spine only: keys, the UTC timestamp, first-seen lineage and the arrival
+  outcome. Cleaned attributes are joined in Task 5.
+  `clean.encounter_row_outcomes` holds one outcome per raw row.
+  `clean.encounter_current` is a view.
+  - Why the view: version order and "current" are derived there, so a late,
+    older version never forces an update to rows already written.
+- **Lineage points to a version's first arrival** (earliest batch, file and
+  row).
+  - Why: the first arrival is the row that supplied the version; later copies
+    are duplicates of it.
+  - This choice affects 36 encounters' current lineage, which would point to
+    batch_002 instead of batch_001 if the latest arrival were used.
+- **A quarantined newest version stays current, flagged, and is excluded from
+  analytics.** There is no fallback to an older version.
+  - Why: the brief fixes the latest timestamp as current. Falling back would
+    report state known to be superseded, for example the old PAID amount of an
+    encounter later voided; there are 34 PAID→VOID transitions in the data.
+  - Task 4 keeps such a version current. The version-level flag and the
+    analytics exclusion come with Task 6. No encounter in the data has a
+    failing newest version and a passing older one.
+- **Late arrival is not a processing class.**
+  - Late encounters and late updates are ordinary versions.
+  - Monthly reporting groups the current state by `admit_date`, so past months
+    change.
+  - As-of reporting picks the latest version with
+    `first_seen_batch_id <= N`.
+  - Result: 19 of the 24 months known at batch_002 have different current
+    totals after batch_003. The as-of-batch_002 totals, read from the final
+    history, still equal what batch_002 left as current.
+
+### Audit and reconciliation
+- **`accepted_count` = `new_encounter_count + new_version_count`**, the rows
+  that created a version that can be current. Stale rows that write a history
+  version count as stale.
+- **Two reconciliation equations per accepted file,** checked against the
+  rows actually written:
+  - `received_count = new_encounter + new_version + duplicate + stale + quarantined`
+    (every raw row has exactly one outcome);
+  - `history_rows_written = new_encounter + new_version + stale_new_version`
+    (every history row is accounted for).
+
+  A mismatch raises `PipelineError` and rolls the whole batch back, so an
+  inconsistent audit row is never published. Each stored row has
+  `reconciliation_status = 'RECONCILED'`.
+- **Rejected batches leave every Task 4 column NULL** (not evaluated), as
+  Stage 1 did for its unevaluated counts.
+- **One transaction per accepted batch** covers raw rows, file records, the
+  history step and the audit rows. `raw_store` runs the history step through a
+  `before_audit` hook, so it never imports `encounter_history` and there is no
+  circular import.
+
+### Redelivery
+- **A duplicate file in a new batch is accepted and flagged.** If a file's
+  exact bytes were ingested in an earlier batch, its audit reason is
+  `DUPLICATE_FILE(first_batch=…)` and a warning is logged. Its rows classify
+  as duplicate or stale, so it adds no versions.
+  - Why: the bytes are valid, and rejecting the file would reject the whole
+    batch.
+- **A changed redelivery of a processed `batch_id` is logged only.** It is
+  still skipped, its audit rows are not changed, and a warning with
+  `BATCH_REDELIVERED_CHANGED` is logged.
+  - Limitation: a rejected batch stored no file hashes, so a changed
+    redelivery of a rejected batch cannot be detected.
+
+### Rebuild, migration and parity
+- **`python -m pipeline.main --rebuild-derived`** rebuilds the history and the
+  audit counts from raw, in one transaction:
+  1. migrate the audit table if needed;
+  2. empty the history tables;
+  3. replay every accepted batch in `batch_id` order through
+     `_classify_into_history`, the same step an incremental load runs;
+  4. overwrite `accepted_count` and the Task 4 audit columns.
+
+  Raw rows and audit status, reason and timings are not touched. The command
+  then carries on as a normal run.
+- **A database from before Task 4 is refused by normal runs.** Its
+  `ops.batch_audit` lacks the Task 4 columns, and `open_store` raises
+  `PipelineError`.
+  - Why: adding the columns silently would leave old batches with no history.
+- **`--rebuild-derived` is the migration path.** Only it opens such a database
+  (`allow_outdated_audit`). The audit table is recreated in the current
+  layout, keeping every row, inside the rebuild transaction. If the rebuild
+  fails, the migration rolls back too: the database stays pre-Task-4, is still
+  refused, and the rebuild can be retried.
+- **"Identical outputs" excludes only `ingested_at`, `start_time` and
+  `end_time`.** They record when a run happened.
+  - All other columns are compared across: incremental 001 → 004, a rerun, a
+    one-shot run, a rebuild of a migrated pre-Task-4 copy, and an in-place
+    rebuild. A test asserts that exactly these three columns are excluded.
+  - A rerun on the same database is identical including timings.
+
+### Known conflict and implementation choice
+- **`clean.encounter_patients` stays a full rebuild on every run.**
+  - Why: patient linkage looks across every batch and source system, so a new
+    batch can legitimately change older rows' `patient_key`, for example when
+    an identity first gains a DOB.
+  - This conflicts with the brief's "each batch updates only the records it
+    touches"; the Task 4 history tables do follow that rule. The rebuild is
+    deterministic: the same secret and raw rows give identical output.
+- **The classifier is pure Python** (`classify_batch`). SQL loads only the
+  touched encounters' history and writes the results.
+  - Why: it is unit-tested without a database, including a permutation test.
+    It reuses the tested timestamp parser and its DST rules, and the
+    fingerprint guard is easier to express there.
+  - In production the same rules become a set-based query per batch and an
+    insert-only `MERGE` on `version_key` (see ARCHITECTURE.md).
+
 ## Approved for later groups (not implemented yet)
 
 - **The Docker container runs as root**, with no `USER` directive. A
