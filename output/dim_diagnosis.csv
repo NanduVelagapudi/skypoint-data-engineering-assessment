@@ -1,0 +1,47 @@
+icd10_code,description,category,is_chronic,in_reference,source_file_name,source_row_number
+A41.9,"Sepsis, unspecified organism",INFECTION,false,true,icd10_reference.csv,24
+E10.9,Type 1 diabetes mellitus without complications,DIABETES,true,true,icd10_reference.csv,4
+E11.22,Type 2 diabetes mellitus with diabetic chronic kidney disease,DIABETES,true,true,icd10_reference.csv,3
+E11.65,Type 2 diabetes mellitus with hyperglycemia,DIABETES,true,true,icd10_reference.csv,2
+E11.9,Type 2 diabetes mellitus without complications,DIABETES,true,true,icd10_reference.csv,1
+E78.5,,,,false,,
+F31.9,"Bipolar disorder, unspecified",BEHAVIORAL_HEALTH,false,true,icd10_reference.csv,18
+F32.9,"Major depressive disorder, single episode, unspecified",BEHAVIORAL_HEALTH,false,true,icd10_reference.csv,15
+F33.1,"Major depressive disorder, recurrent, moderate",BEHAVIORAL_HEALTH,false,true,icd10_reference.csv,16
+F41.1,Generalized anxiety disorder,BEHAVIORAL_HEALTH,false,true,icd10_reference.csv,17
+F43.10,"Post-traumatic stress disorder, unspecified",BEHAVIORAL_HEALTH,false,true,icd10_reference.csv,19
+G47.33,,,,false,,
+I10,Essential (primary) hypertension,HYPERTENSION,true,true,icd10_reference.csv,5
+I21.9,"Acute myocardial infarction, unspecified",CARDIAC_ACUTE,false,true,icd10_reference.csv,20
+I48.91,Unspecified atrial fibrillation,CARDIAC_ACUTE,false,true,icd10_reference.csv,21
+I50.22,Chronic systolic (congestive) heart failure,HEART_FAILURE,true,true,icd10_reference.csv,7
+I50.32,Chronic diastolic (congestive) heart failure,HEART_FAILURE,true,true,icd10_reference.csv,8
+I50.9,"Heart failure, unspecified",HEART_FAILURE,true,true,icd10_reference.csv,6
+I63.9,"Cerebral infarction, unspecified",STROKE,false,true,icd10_reference.csv,22
+J02.9,"Acute pharyngitis, unspecified",INFECTION,false,true,icd10_reference.csv,27
+J06.9,"Acute upper respiratory infection, unspecified",INFECTION,false,true,icd10_reference.csv,26
+J18.9,"Pneumonia, unspecified organism",INFECTION,false,true,icd10_reference.csv,23
+J44.1,Chronic obstructive pulmonary disease with (acute) exacerbation,COPD,true,true,icd10_reference.csv,10
+J44.9,"Chronic obstructive pulmonary disease, unspecified",COPD,true,true,icd10_reference.csv,9
+J45.901,Unspecified asthma with (acute) exacerbation,ASTHMA,true,true,icd10_reference.csv,14
+J45.909,"Unspecified asthma, uncomplicated",ASTHMA,true,true,icd10_reference.csv,13
+K21.9,,,,false,,
+M17.0,Bilateral primary osteoarthritis of knee,MUSCULOSKELETAL,false,true,icd10_reference.csv,38
+M17.11,"Unilateral primary osteoarthritis, right knee",MUSCULOSKELETAL,false,true,icd10_reference.csv,37
+M25.561,Pain in right knee,MUSCULOSKELETAL,false,true,icd10_reference.csv,40
+M54.50,"Low back pain, unspecified",MUSCULOSKELETAL,false,true,icd10_reference.csv,39
+N17.9,"Acute kidney failure, unspecified",RENAL_ACUTE,false,true,icd10_reference.csv,29
+N18.4,"Chronic kidney disease, stage 4 (severe)",CKD,true,true,icd10_reference.csv,11
+N18.6,End stage renal disease,CKD,true,true,icd10_reference.csv,12
+N39.0,"Urinary tract infection, site not specified",INFECTION,false,true,icd10_reference.csv,25
+R07.9,"Chest pain, unspecified",SYMPTOM,false,true,icd10_reference.csv,30
+R10.9,Unspecified abdominal pain,SYMPTOM,false,true,icd10_reference.csv,31
+R50.9,"Fever, unspecified",SYMPTOM,false,true,icd10_reference.csv,33
+R51.9,"Headache, unspecified",SYMPTOM,false,true,icd10_reference.csv,32
+S06.0X0A,"Concussion without loss of consciousness, initial encounter",INJURY,false,true,icd10_reference.csv,36
+S52.501A,"Unspecified fracture of the lower end of right radius, initial encounter for closed fracture",INJURY,false,true,icd10_reference.csv,34
+S93.401A,"Sprain of unspecified ligament of right ankle, initial encounter",INJURY,false,true,icd10_reference.csv,35
+U07.1,COVID-19,INFECTION,false,true,icd10_reference.csv,28
+Z00.00,Encounter for general adult medical examination without abnormal findings,PREVENTIVE,false,true,icd10_reference.csv,41
+Z00.129,Encounter for routine child health examination without abnormal findings,PREVENTIVE,false,true,icd10_reference.csv,42
+Z23,Encounter for immunization,PREVENTIVE,false,true,icd10_reference.csv,43

@@ -1,0 +1,9 @@
+facility_id,facility_name,source_system,facility_type,city,state,bed_count,ownership,go_live_date,source_file_name,source_position
+FAC001,Lakeshore General Hospital,EPIC_NORTH,Acute Care Hospital,Milwaukee,WI,320,Owned,2021-06-01,source_systems_and_facilities.json,1
+FAC002,St. Brendan Medical Center,EPIC_NORTH,Acute Care Hospital,Madison,WI,210,Owned,2021-06-01,source_systems_and_facilities.json,2
+FAC003,Maple Grove Pediatrics,EPIC_NORTH,Clinic,Waukesha,WI,0,Owned,2022-01-15,source_systems_and_facilities.json,3
+FAC004,Riverbend Community Hospital,LEGACY_MEDITECH,Critical Access Hospital,Dubuque,IA,25,Affiliated,2024-03-01,source_systems_and_facilities.json,4
+FAC005,Harbor Point Behavioral Health,LEGACY_MEDITECH,Behavioral Health Hospital,Rockford,IL,60,Affiliated,2022-09-01,source_systems_and_facilities.json,5
+FAC006,Cedar Valley Family Clinic,ATHENA_CLINICS,Clinic,Cedar Rapids,IA,0,Owned,2020-11-01,source_systems_and_facilities.json,6
+FAC007,Eastgate Urgent Care,ATHENA_CLINICS,Urgent Care,Kenosha,WI,0,Owned,2020-11-01,source_systems_and_facilities.json,7
+FAC008,Summit Ridge Orthopedics,ATHENA_CLINICS,Specialty Clinic,Green Bay,WI,0,Affiliated,2023-02-01,source_systems_and_facilities.json,8
