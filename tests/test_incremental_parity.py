@@ -22,8 +22,8 @@ import csv
 import hashlib
 import logging
 import shutil
-from collections import defaultdict
-from datetime import datetime
+from collections import Counter, defaultdict
+from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
 
@@ -42,6 +42,7 @@ from conftest import (
 
 from pipeline import version_fields
 from pipeline.batch_audit import AUDIT_COLUMNS, TASK4_COLUMNS
+from pipeline.dimensions import VALID_FROM_EARLIEST, ProviderLookup, ProviderRow
 from pipeline.main import main
 from pipeline.parsers.amount import parse_amount
 from pipeline.parsers.categorical import ClaimStatus, parse_claim_status
@@ -182,6 +183,51 @@ def null_without_reason(con) -> int:
     return con.execute(f"SELECT {checks} FROM {version_fields.TABLE}").fetchone()[0]
 
 
+def provider_lookup(con) -> dict:
+    """Point-in-time provider lookup for every current version, in Python and in SQL."""
+    cursor = con.execute("SELECT * FROM mart.dim_provider")
+    names = [d[0] for d in cursor.description]
+    rows = [ProviderRow(**dict(zip(names, r, strict=True))) for r in cursor.fetchall()]
+    lookup, by_sk = ProviderLookup(rows), {r.provider_sk: r for r in rows}
+    latest = {r.npi: r for r in rows if r.is_current}
+    outcomes, differs_from_latest = Counter(), 0
+    for npi, admit, npi_reason in con.execute(
+        f"SELECT f.attending_npi, f.admit_date, f.attending_npi_reason FROM {version_fields.TABLE} f "
+        "JOIN clean.encounter_current c USING (version_key)"
+    ).fetchall():
+        sk, reason = lookup.at(npi, admit, npi_reason)
+        if sk is None:
+            outcomes[reason] += 1
+            continue
+        outcomes["found, admit before 2024-07-01" if admit < date(2024, 7, 1) else "found, admit from 2024-07-01"] += 1
+        found, newest = by_sk[sk], latest.get(npi)
+        if newest and (found.specialty, found.employment_status) != (newest.specialty, newest.employment_status):
+            differs_from_latest += 1
+    sql_matches = con.execute(
+        f"SELECT count(*) FROM {version_fields.TABLE} f JOIN clean.encounter_current c USING (version_key) "
+        "JOIN mart.dim_provider p ON p.npi = f.attending_npi AND f.admit_date >= p.valid_from AND f.admit_date < p.valid_to"
+    ).fetchone()[0]
+    return {"outcomes": dict(outcomes), "differs_from_latest": differs_from_latest, "sql_matches": sql_matches}
+
+
+def scd2_rows_from_roster_files() -> int:
+    """dim_provider's row count recomputed straight from the roster CSVs: one row per unchanged stretch."""
+    snapshots = []
+    for path in sorted((REFERENCE / "provider_roster").glob("roster_*.csv")):
+        with path.open(encoding="utf-8-sig", newline="") as handle:
+            snapshots.append({row["npi"]: tuple(v for k, v in row.items() if k not in ("as_of_date", "npi"))
+                              for row in csv.DictReader(handle)})
+    rows = 0
+    for npi in {npi for snapshot in snapshots for npi in snapshot}:
+        previous = None
+        for snapshot in snapshots:
+            current = snapshot.get(npi)
+            if current is not None and current != previous:
+                rows += 1
+            previous = current
+    return rows
+
+
 def capture(env) -> dict:
     db = Path(env["RAW_DB_PATH"])
     con = attach(db)
@@ -194,6 +240,17 @@ def capture(env) -> dict:
             "late_update_months": late_update_months(con),
             "field_flags": field_flags(con),
             "null_without_reason": null_without_reason(con),
+            "provider_lookup": provider_lookup(con),
+            "dim_provider_starts": dict(con.execute(
+                "SELECT valid_from, count(*) FROM mart.dim_provider GROUP BY 1").fetchall()),
+            "dim_date_range": con.execute("SELECT min(date_key), max(date_key), count(*) FROM mart.dim_date").fetchone(),
+            "dates_outside_dim_date": con.execute(
+                f"SELECT count(*) FROM {version_fields.TABLE} f WHERE "
+                "(f.admit_date IS NOT NULL AND f.admit_date NOT IN (SELECT date_key FROM mart.dim_date)) OR "
+                "(f.discharge_date IS NOT NULL AND f.discharge_date NOT IN (SELECT date_key FROM mart.dim_date))"
+            ).fetchone()[0],
+            "dim_diagnosis_in_reference": dict(con.execute(
+                "SELECT in_reference, count(*) FROM mart.dim_diagnosis GROUP BY 1").fetchall()),
         }
     finally:
         con.close()
@@ -414,3 +471,47 @@ def test_approved_field_reasons_and_warnings(runs):
 def test_every_null_cleaned_value_has_a_reason(runs):
     for run in FINAL_RUNS:
         assert runs[run]["null_without_reason"] == 0, run
+
+
+# --- mart dimensions (Task 5 group b) ---
+
+
+def test_dim_provider_rows_match_an_independent_recount_of_the_roster():
+    assert scd2_rows_from_roster_files() == 65
+
+
+def test_dim_provider_scd2_rows(runs):
+    state = runs["batch_004"]
+
+    assert state["counts"]["mart.dim_provider"] == scd2_rows_from_roster_files() == 65
+    # 50 rows from the earliest snapshot apply backwards; 12 start in July 2024 and 3 in January 2025.
+    assert state["dim_provider_starts"] == {VALID_FROM_EARLIEST: 50, date(2024, 7, 1): 12, date(2025, 1, 1): 3}
+
+
+def test_point_in_time_provider_lookup_on_current_versions(runs):
+    lookup = runs["batch_004"]["provider_lookup"]
+
+    # The Task 5 design profile: 2,374 + 844 found in the snapshot applicable at admission,
+    # 18 valid NPIs in no roster, 18 admit dates unknown, and 20 invalid NPIs (2 + 9 + 4 + 5).
+    assert lookup["outcomes"] == {
+        "found, admit before 2024-07-01": 2374,
+        "found, admit from 2024-07-01": 844,
+        "NPI_NOT_IN_ROSTER": 18,
+        "PROVIDER_ADMIT_DATE_UNKNOWN": 18,
+        "NPI_PLACEHOLDER": 2,
+        "NPI_INVALID_FORMAT": 9,
+        "NPI_CHECKSUM_FAILED": 4,
+        "NPI_MISSING": 5,
+    }
+    assert lookup["differs_from_latest"] == 336  # why SCD2 matters: point-in-time differs from the latest snapshot
+    assert lookup["sql_matches"] == 2374 + 844  # the SQL join on valid_from/valid_to agrees with the lookup
+
+
+def test_other_dimensions(runs):
+    state = runs["batch_004"]
+
+    assert state["counts"]["mart.dim_facility"] == 8
+    assert state["counts"]["mart.dim_payer"] == 6
+    assert state["dim_diagnosis_in_reference"] == {True: 43, False: 3}
+    assert state["dim_date_range"] == (date(2023, 1, 1), date(2025, 12, 31), 1096)
+    assert state["dates_outside_dim_date"] == 0

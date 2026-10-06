@@ -183,6 +183,11 @@ STATE_TABLES = (
     "clean.encounter_current",
     "clean.encounter_patients",
     "clean.encounter_version_fields",
+    "mart.dim_provider",
+    "mart.dim_facility",
+    "mart.dim_diagnosis",
+    "mart.dim_payer",
+    "mart.dim_date",
 )
 
 
@@ -199,8 +204,8 @@ def attach(db_path: Path):
 def make_pre_task4(db_path: Path) -> None:
     """Turn a pipeline database into what a pre-Task-4 build left behind.
 
-    The history tables, the view and the cleaned version fields (added after
-    Task 4) are dropped, and ops.batch_audit goes back to the
+    The history tables, the view, the cleaned version fields and the mart
+    schema (added after Task 4) are dropped, and ops.batch_audit goes back to the
     Stage 1 layout with Stage 1 values: accepted_count = rows landed for an
     accepted file, and duplicate, stale and quarantined counts NULL. Raw rows,
     file records, encounter_patients and audit timings are kept as they are.
@@ -211,6 +216,7 @@ def make_pre_task4(db_path: Path) -> None:
         con.execute("DROP TABLE IF EXISTS clean.encounter_versions")
         con.execute("DROP TABLE IF EXISTS clean.encounter_row_outcomes")
         con.execute("DROP TABLE IF EXISTS clean.encounter_version_fields")
+        con.execute("DROP SCHEMA IF EXISTS mart CASCADE")
         con.execute(STAGE1_AUDIT_DDL)
         con.execute(
             "INSERT INTO ops.batch_audit_stage1 "

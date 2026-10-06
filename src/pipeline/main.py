@@ -3,7 +3,8 @@
 Processes every pending landing batch in order (each accepted batch also adds
 its rows to the encounter history, Task 4, and the cleaned Task 2 fields of its
 new versions to clean.encounter_version_fields), rebuilds the PHI-free
-clean.encounter_patients table (Task 3), then exports output/batch_audit.csv.
+clean.encounter_patients table (Task 3) and the mart dimensions (Task 5), then
+exports output/batch_audit.csv.
 
 --rebuild-derived first rebuilds the Task 4 history and audit counts from the
 raw layer, replaying every accepted batch through the same step as an
@@ -33,7 +34,8 @@ from pipeline.config import Settings, load_settings, require_patient_key_secret
 from pipeline.errors import PipelineError
 from pipeline.logging_setup import configure_logging
 from pipeline.raw_store import open_store
-from pipeline.reference_data import load_cleaning_reference
+from pipeline.dimensions import rebuild_dimensions
+from pipeline.reference_data import load_cleaning_reference, load_warehouse_reference
 from pipeline.schema_contract import load_contracts
 from pipeline.source_conventions import load_source_conventions
 
@@ -58,6 +60,7 @@ def run(settings: Settings, secret: bytes, rebuild_derived_state: bool = False) 
     contracts = load_contracts(settings.schema_contract_path)
     conventions = load_source_conventions(settings.reference_dir / "source_systems_and_facilities.json")
     reference = load_cleaning_reference(settings.reference_dir, settings.facility_aliases_path)
+    warehouse_reference = load_warehouse_reference(settings.reference_dir)
     if not settings.landing_dir.is_dir():
         raise PipelineError("landing folder not found")
 
@@ -67,6 +70,7 @@ def run(settings: Settings, secret: bytes, rebuild_derived_state: bool = False) 
             rebuild_derived(con, conventions, reference)
         results = run_pending_batches(con, settings.landing_dir, contracts, conventions, reference)
         build_encounter_patients(con, conventions, secret)
+        rebuild_dimensions(con, warehouse_reference)
         export_csv(con, settings.output_dir / AUDIT_CSV_NAME)
     finally:
         con.close()

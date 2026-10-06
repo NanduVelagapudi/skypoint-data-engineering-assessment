@@ -214,6 +214,23 @@ def load_roster_snapshots(directory: Path) -> tuple[RosterSnapshot, ...]:
     return tuple(sorted(snapshots, key=lambda s: s.as_of_date))
 
 
+@dataclass(frozen=True)
+class WarehouseReference:
+    """The reference data the mart dimensions are built from."""
+
+    facilities: tuple[FacilityRecord, ...]
+    icd10: tuple[Icd10Entry, ...]
+    roster: tuple[RosterSnapshot, ...]
+
+
+def load_warehouse_reference(reference_dir: Path) -> WarehouseReference:
+    return WarehouseReference(
+        facilities=load_facility_records(reference_dir / FACILITY_MASTER_FILE),
+        icd10=load_icd10_reference(reference_dir / ICD10_REFERENCE_FILE),
+        roster=load_roster_snapshots(reference_dir / ROSTER_DIR),
+    )
+
+
 def load_cleaning_reference(reference_dir: Path, aliases_path: Path) -> CleaningReference:
     """The reference data the Task 2 field cleaning uses, loaded and checked once per run."""
     snapshots = load_roster_snapshots(reference_dir / ROSTER_DIR)
