@@ -15,7 +15,8 @@ with a PHI column (clean_patients.PHI_COLUMNS, also as a *_raw column) is
 refused, so nothing from the raw layer, no chief_complaint and no patient name
 reaches OUTPUT_DIR. The ops tables exported are only the DQ report and the
 quarantine, which hold codes, keys and lineage. batch_audit.csv is written
-separately by batch_audit.export_csv.
+separately by batch_audit.export_csv, and the Task 7 export
+chronic_acute_encounters.csv by chronic_acute_export with write_csv.
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ from __future__ import annotations
 import csv
 import logging
 import os
+from collections.abc import Iterable, Sequence
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -80,22 +82,20 @@ def format_value(value: object) -> str:
     return str(value)
 
 
+def check_no_phi_columns(name: str, columns: Sequence[str]) -> None:
+    phi = {c for c in columns if c in PHI_COLUMNS or c.removesuffix("_raw") in PHI_COLUMNS}
+    if phi:
+        raise PipelineError(f"{name} has PHI columns and cannot be exported")
+
+
 def _check_exportable(table: str, columns: list[str]) -> None:
     if table.split(".", 1)[0] not in EXPORT_SCHEMAS:
         raise PipelineError(f"{table} is not in an exportable schema")
-    phi = {c for c in columns if c in PHI_COLUMNS or c.removesuffix("_raw") in PHI_COLUMNS}
-    if phi:
-        raise PipelineError(f"{table} has PHI columns and cannot be exported")
+    check_no_phi_columns(table, columns)
 
 
-def export_table(con: duckdb.DuckDBPyConnection, table: str, order_by: tuple[str, ...], path: Path) -> int:
-    """Write one table to `path`; returns the number of rows."""
-    columns = [r[0] for r in con.execute(f"DESCRIBE {table}").fetchall()]
-    _check_exportable(table, columns)
-    if not {c.removesuffix(NULLS_FIRST) for c in order_by} <= set(columns):
-        raise PipelineError(f"{table} lacks its export ordering columns")
-    rows = con.execute(f"SELECT {', '.join(columns)} FROM {table} ORDER BY {', '.join(order_by)}").fetchall()
-
+def write_csv(path: Path, columns: Sequence[str], rows: Iterable[Sequence[object]]) -> None:
+    """Write a header and formatted rows to `path` through a temp file and a rename."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
     try:
@@ -106,6 +106,16 @@ def export_table(con: duckdb.DuckDBPyConnection, table: str, order_by: tuple[str
         os.replace(tmp, path)
     finally:
         tmp.unlink(missing_ok=True)
+
+
+def export_table(con: duckdb.DuckDBPyConnection, table: str, order_by: tuple[str, ...], path: Path) -> int:
+    """Write one table to `path`; returns the number of rows."""
+    columns = [r[0] for r in con.execute(f"DESCRIBE {table}").fetchall()]
+    _check_exportable(table, columns)
+    if not {c.removesuffix(NULLS_FIRST) for c in order_by} <= set(columns):
+        raise PipelineError(f"{table} lacks its export ordering columns")
+    rows = con.execute(f"SELECT {', '.join(columns)} FROM {table} ORDER BY {', '.join(order_by)}").fetchall()
+    write_csv(path, columns, rows)
     return len(rows)
 
 

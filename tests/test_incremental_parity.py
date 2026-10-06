@@ -1,7 +1,8 @@
 """Incremental, one-shot, rerun and rebuild runs on the real data pack agree, with the approved real-data counts.
 
 Started in Task 4 group (c); later groups add their pins here (Task 5 cleaned fields, mart
-dimensions, facts and exports; Task 6 version DQ issues and the DQ report).
+dimensions, facts and exports; Task 6 version DQ issues and the DQ report; the Task 7
+chronic_acute_encounters.csv export).
 
 The data pack is only read: batch folders are copied into tmp_path for the
 incremental runs. Every database and output folder lives in tmp_path, and the
@@ -44,7 +45,7 @@ from conftest import (
     state_digest,
 )
 
-from pipeline import dq_report, dq_rules, publish_gate, quarantine, version_dq, version_fields
+from pipeline import chronic_acute_export, dq_report, dq_rules, publish_gate, quarantine, version_dq, version_fields
 from pipeline.batch_audit import AUDIT_COLUMNS, TASK4_COLUMNS
 from pipeline.dimensions import VALID_FROM_EARLIEST, ProviderLookup, ProviderRow
 from pipeline.exports import EXPORTED_TABLES, file_name
@@ -303,11 +304,57 @@ def dq_state(con) -> dict:
     }
 
 
+def chronic_state(con, output_dir: Path) -> dict:
+    """The Task 7 export, and its rows and readmit flags recomputed in Python from the current facts."""
+    with (output_dir / chronic_acute_export.FILE_NAME).open(encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    current = con.execute(
+        "SELECT f.encounter_key, f.patient_key, f.facility_id, f.encounter_type, f.claim_status, f.admit_date, "
+        "       f.discharge_date, f.billed_amount_usd, d.in_reference AND d.is_chronic, "
+        "       EXISTS (SELECT 1 FROM clean.version_dq_issues i WHERE i.version_key = f.version_key AND i.severity = 'ERROR') "
+        "FROM mart.fact_encounter_current f LEFT JOIN mart.dim_diagnosis d ON d.icd10_code = f.primary_dx_code"
+    ).fetchall()
+    meets_six, followups = {}, []
+    for key, patient_key, facility, kind, claim, admit, discharge, amount, chronic, has_error in current:
+        if (facility is not None and claim != "VOID" and kind in ("INPATIENT", "OBSERVATION", "EMERGENCY")
+                and chronic is True and admit is not None and admit.year == 2024
+                and amount is not None and amount >= Decimal("5000.00")):  # fmt: skip
+            meets_six[key] = (patient_key, facility, kind, discharge, has_error)
+        if (kind == "INPATIENT" and claim != "VOID" and facility is not None and admit is not None
+                and discharge is not None and patient_key is not None):  # fmt: skip
+            followups.append((key, patient_key, facility, admit))
+    expected = {k: v for k, v in meets_six.items() if not v[4]}
+
+    flags, outside_export, other_facility = {}, 0, 0
+    for key, (patient_key, facility, kind, discharge, _) in expected.items():
+        if kind != "INPATIENT":
+            flags[key] = ""
+            continue
+        hits = [f for f in followups if discharge is not None and f[1] == patient_key and f[0] != key
+                and 1 <= (f[3] - discharge).days <= 30]  # fmt: skip
+        flags[key] = "1" if hits else "0"
+        outside_export += bool(hits) and all(f[0] not in expected for f in hits)
+        other_facility += bool(hits) and all(f[2] != facility for f in hits)
+    return {
+        "rows": len(rows),
+        "matches_recount": {r["encounter_key"]: r["readmit_30d_flag"] for r in rows} == flags,
+        "error_excluded": len(meets_six) - len(expected),
+        "flags": Counter((r["encounter_type"], r["readmit_30d_flag"]) for r in rows),
+        "readmits_only_outside_export": outside_export,
+        "readmits_only_other_facility": other_facility,
+        "null_claim_status": sum(r["claim_status"] == "" for r in rows),
+        "no_provider": sum(r["attending_specialty_at_encounter"] == "" for r in rows),
+        "sorted": [(r["admit_date"], r["source_system"], r["source_record_id"]) for r in rows]
+        == sorted((r["admit_date"], r["source_system"], r["source_record_id"]) for r in rows),
+    }
+
+
 def capture(env) -> dict:
     db = Path(env["RAW_DB_PATH"])
     con = attach(db)
     try:
         state = {
+            "chronic": chronic_state(con, Path(env["OUTPUT_DIR"])),
             "dq": dq_state(con),
             "audit": con.execute(f"SELECT {', '.join(AUDIT_COLUMNS)} FROM ops.batch_audit ORDER BY batch_id, file_name").fetchall(),
             "counts": {t: con.execute(f"SELECT count(*) FROM {t}").fetchone()[0] for t in STATE_TABLES},
@@ -654,7 +701,7 @@ def test_exported_csvs_are_byte_identical(runs, run):
     """Every table CSV is byte for byte the same; batch_audit.csv is compared without its timings above."""
     reference = runs["batch_004"]["exports"]
 
-    assert sorted(reference) == sorted(file_name(t) for t in EXPORTED_TABLES)
+    assert sorted(reference) == sorted([*(file_name(t) for t in EXPORTED_TABLES), chronic_acute_export.FILE_NAME])
     assert runs[run]["exports"].keys() == reference.keys()
     for name, content in reference.items():
         assert runs[run]["exports"][name] == content, (run, name)
@@ -897,3 +944,31 @@ def test_quarantine_lineage_and_reconciliation(runs, run):
     rows = report_rows(runs[run], check_code="RECON_QUARANTINE_ROWS", batch_status="ACCEPTED")
     assert len(rows) == 9 and {r["status"] for r in rows} == {"PASS"}
     assert sum(r["observed_count"] for r in rows) == 50  # 0 Task 4 rows + 50 ERROR versions
+
+
+# --- Task 7: chronic_acute_encounters.csv ---
+
+
+@pytest.mark.parametrize("run", FINAL_RUNS)
+def test_chronic_acute_export_matches_an_independent_recount(runs, run):
+    chronic = runs[run]["chronic"]
+
+    assert chronic["matches_recount"] and chronic["sorted"]
+
+
+def test_approved_chronic_acute_export_counts(runs):
+    chronic = runs["batch_004"]["chronic"]
+
+    assert chronic["rows"] == 247
+    assert chronic["flags"] == {
+        ("INPATIENT", "1"): 25, ("INPATIENT", "0"): 156, ("OBSERVATION", ""): 34, ("EMERGENCY", ""): 32}
+    # Every current ERROR version also fails condition 1 (facility) or 5 (admit date in 2024).
+    assert chronic["error_excluded"] == 0
+    # Of the 25 readmissions, 2 rely only on follow-ups outside the export and 10 only on other facilities.
+    assert (chronic["readmits_only_outside_export"], chronic["readmits_only_other_facility"]) == (2, 10)
+    assert chronic["null_claim_status"] == 0  # no current claim status is NULL in the data
+    assert chronic["no_provider"] == 2  # an invalid NPI and an NPI in no roster
+
+
+def test_rejected_batch_004_changes_no_chronic_acute_row(runs):
+    assert runs["batch_004"]["chronic"] == runs["batch_003"]["chronic"]

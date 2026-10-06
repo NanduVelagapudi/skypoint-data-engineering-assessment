@@ -15,6 +15,7 @@ import pytest
 from conftest import REPO_ROOT, FileSpec, attach, contract_header, csv_bytes, write_batch
 
 from pipeline import dq_report, exports, quarantine, version_dq
+from pipeline.chronic_acute_export import FILE_NAME as CHRONIC_ACUTE_FILE
 from pipeline.clean_patients import PHI_COLUMNS
 from pipeline.errors import PipelineError
 from pipeline.exports import EXPORTED_TABLES, NULLS_FIRST, export_table, file_name, format_value
@@ -24,7 +25,7 @@ pytestmark = pytest.mark.usefixtures("restore_pipeline_logger")
 
 SQL_DIR = REPO_ROOT / "sql"
 QUERY_FILES = sorted(SQL_DIR.glob("q*.sql"))
-EXPORT_FILES = sorted([*(file_name(t) for t in EXPORTED_TABLES), "batch_audit.csv"])
+EXPORT_FILES = sorted([*(file_name(t) for t in EXPORTED_TABLES), "batch_audit.csv", CHRONIC_ACUTE_FILE])
 
 
 def run_query(con, name, **params):

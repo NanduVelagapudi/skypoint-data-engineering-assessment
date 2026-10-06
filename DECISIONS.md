@@ -736,6 +736,73 @@ All entries below were approved in design review. Counts are for batches
   `is_chronic`. The reference does not say whether they are chronic, so a
   chronic filter (Task 7) excludes them rather than counting them as acute.
 
+## Task 7: chronic_acute_encounters.csv
+
+Implemented in `chronic_acute_export.py` and written by every run after the
+table exports. Counts are for batches 001–003 (batch_004 is rejected and
+changes no row).
+
+### Filter
+- **One row per encounter, from its current version** in
+  `mart.fact_encounter_current`, when all six brief conditions hold:
+  1. the facility resolved to the facility master (`facility_id` joins
+     `dim_facility`);
+  2. `claim_status IS DISTINCT FROM 'VOID'`, so a NULL claim status is kept, as
+     in queries 1 and 5;
+  3. `encounter_type` is `INPATIENT`, `OBSERVATION` or `EMERGENCY`;
+  4. the primary diagnosis is in the ICD-10 reference with `is_chronic = Y`. A
+     valid code missing from the reference has `is_chronic` unknown and is left
+     out (see Task 5);
+  5. `admit_date` is in calendar year 2024;
+  6. `billed_amount_usd` is valid (not NULL) and at least 5,000.00.
+- **The Task 6 ERROR exclusion of queries 1 and 5 also applies.** A current
+  version with an ERROR in `clean.version_dq_issues` is left out, with no
+  fallback to an older version. The only version ERRORs are an unresolved
+  facility and an unusable admit date, which already fail conditions 1 and 5,
+  so the clause excludes 0 extra rows today. It stays so that a future ERROR
+  check is honoured without a change here.
+- Result: **247 rows** (181 INPATIENT, 34 OBSERVATION, 32 EMERGENCY).
+
+### readmit_30d_flag
+- **For INPATIENT rows: 1 when the same `patient_key` has another INPATIENT
+  encounter admitted 1 to 30 days after this row's `discharge_date`, at any
+  facility; otherwise 0. Blank for OBSERVATION and EMERGENCY.** Day 0 (admitted
+  on the discharge day) and day 31 do not count.
+- **The other encounter is searched among all current encounters,** not only
+  this export's rows: any year, diagnosis or amount. It must be non-VOID
+  (`IS DISTINCT FROM`, so a NULL claim status counts), at a resolved facility,
+  and have valid dates.
+- **"Valid dates" means both `admit_date` and `discharge_date` parsed (not
+  NULL).** A discharge before admission is still two valid dates (Task 2 keeps
+  both and only warns), so it does not disqualify the other encounter.
+  *(Implementation choice; open for review.)* No real follow-up candidate is
+  affected: reading it as "admit date only", or also requiring discharge not
+  before admit, gives the same 25 flags.
+- **An INPATIENT row with a NULL `discharge_date` gets 0,** as there is no
+  window to search (none in the export today). A row with a NULL `patient_key`
+  (blank MRN) also gets 0: NULL keys never match each other (none today).
+- **A row whose own discharge is before its admission uses its
+  `discharge_date` as stored.** *(Implementation choice; open for review.)* None
+  in the export today.
+- Result: 25 of 181 INPATIENT rows are flagged; 2 of them only through
+  encounters outside the export and 10 only through another facility.
+
+### Columns and format
+- **Columns in the brief's order.** `patient_zip3`, `age_band` and `sex` are the
+  current version's values from the facts; `dx_description` and
+  `chronic_category` are the reference's description and category.
+- **The provider's specialty and employment status come from the
+  point-in-time `dim_provider` row** the facts chose for the admit date
+  (`provider_sk`), and are blank when there is none (2 rows: an invalid NPI and
+  an NPI in no roster). The latest snapshot is never used instead.
+- **Lineage columns point to the row that supplied the current version** (its
+  first arrival), as in the facts; `version_count` is the encounter's.
+- **Sorted by `admit_date`, `source_system`, `source_record_id`** (text order).
+  Formats are the table exports': ISO dates, two-decimal amounts, NULL as an
+  empty string, UTF-8, LF line endings, written through a temp file and a
+  rename. The file is byte-identical across incremental, one-shot, rerun and
+  rebuild runs.
+
 ## Approved for later groups (not implemented yet)
 
 - **The Docker container runs as root**, with no `USER` directive. A

@@ -9,7 +9,8 @@ PHI-free clean.encounter_patients table (Task 3), the mart tables (Task 5) and,
 in the same transaction, the DQ tables clean.version_dq_issues, ops.quarantine
 and ops.dq_report (Task 6), and exports output/batch_audit.csv and one CSV per
 PHI-free clean and mart table and per DQ table (version_dq_issues.csv,
-quarantine.csv, dq_report.csv).
+quarantine.csv, dq_report.csv), and the Task 7 export
+chronic_acute_encounters.csv.
 
 --rebuild-derived first rebuilds the Task 4 history and audit counts from the
 raw layer, replaying every accepted batch through the same step as an
@@ -34,6 +35,8 @@ from collections.abc import Mapping, Sequence
 
 from pipeline.batch_audit import BatchStatus, export_csv
 from pipeline.batch_processor import BatchResult, rebuild_derived, run_pending_batches
+from pipeline.chronic_acute_export import FILE_NAME as CHRONIC_ACUTE_FILE
+from pipeline.chronic_acute_export import export_chronic_acute
 from pipeline.clean_patients import build_encounter_patients
 from pipeline.config import Settings, load_settings, require_patient_key_secret
 from pipeline.errors import PipelineError
@@ -81,6 +84,7 @@ def run(settings: Settings, secret: bytes, rebuild_derived_state: bool = False) 
         rebuild_mart(con, warehouse_reference, conventions, settings.dq_gate_max_error_share)
         export_csv(con, settings.output_dir / AUDIT_CSV_NAME)
         export_tables(con, settings.output_dir)
+        export_chronic_acute(con, settings.output_dir / CHRONIC_ACUTE_FILE)
     finally:
         con.close()
     return results

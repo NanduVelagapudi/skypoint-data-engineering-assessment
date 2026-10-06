@@ -41,6 +41,7 @@ from conftest import (
 )
 
 from pipeline import encounter_history, patient_identity
+from pipeline.chronic_acute_export import FILE_NAME as CHRONIC_ACUTE_FILE
 from pipeline.exports import EXPORTED_TABLES, file_name
 from pipeline.main import main
 from pipeline.parsers import amount, categorical, patient, result
@@ -49,7 +50,7 @@ from pipeline.source_conventions import load_source_conventions
 
 SQL_DIR = REPO_ROOT / "sql"
 CONVENTIONS = load_source_conventions(REAL_DATA_DIR / "reference" / "source_systems_and_facilities.json")
-EXPORT_FILES = sorted([*(file_name(t) for t in EXPORTED_TABLES), "batch_audit.csv"])
+EXPORT_FILES = sorted([*(file_name(t) for t in EXPORTED_TABLES), "batch_audit.csv", CHRONIC_ACUTE_FILE])
 PROVIDER_NAME_COLUMNS = {("dim_provider.csv", "provider_last_name"), ("dim_provider.csv", "provider_first_name")}
 GENERIC_MARKERS = {"TEST"}
 LINEAGE_COLUMNS = {
