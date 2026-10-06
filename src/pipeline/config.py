@@ -1,7 +1,8 @@
 """Runtime settings, read from environment variables.
 
-Defaults suit a local run from a repository checkout. Docker sets every value
-explicitly in docker-compose.yml.
+Defaults suit a local run from a repository checkout. Under Docker, every value
+still arrives as an environment variable: docker-compose.yml sets the container
+paths, and Compose loads the other values from .env.example and an optional .env.
 """
 
 from __future__ import annotations

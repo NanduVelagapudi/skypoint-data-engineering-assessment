@@ -141,8 +141,9 @@ whether it is an implementation choice still open for review.
   `cleaned_value`, `reason_code` and `warning_flag`. Exactly one of
   `cleaned_value` and `reason_code` is set, so every NULL has a reason, and the
   raw value travels next to the cleaned one, as Task 2 requires.
-  `warning_flag` marks something notable about a valid value; today it is only
-  used for an ambiguous local time.
+  `warning_flag` marks something notable about a valid value; at D0 it was
+  only used for an ambiguous local time, and later decisions added more flags
+  (for example `*_MISSING` and `DX_NOT_IN_REFERENCE` in D2).
 - **Reason codes, not severity.** All field-level codes are in one enum,
   `FieldReason`, kept apart from the batch-rejection codes in
   `errors.ReasonCode`. Parsers never decide whether a code is an error or a
@@ -736,6 +737,196 @@ All entries below were approved in design review. Counts are for batches
   `is_chronic`. The reference does not say whether they are chronic, so a
   chronic filter (Task 7) excludes them rather than counting them as acute.
 
+## Task 6: data quality and observability
+
+Implemented in `dq_rules.py` (the check
+catalogue), `publish_gate.py`, `version_dq.py`, `quarantine.py` and
+`dq_report.py`. Counts are for the real data pack.
+
+### Checks and severity
+- **One catalogue of checks** (`dq_rules.CHECKS`). Each check has a code, a
+  category, the layer and grain it looks at, a severity and a kind (quality,
+  observation, reconciliation or gate).
+- **Checks reuse the reason codes Tasks 1–5 already produce;** nothing is
+  parsed again. Every code is classified by where it is read (`CODE_MAP`): it
+  is counted by a check, or it is a derivative represented by its parent check
+  (for example `AGE_BAND_ADMIT_UNAVAILABLE` under `ADMIT_DATE_VALID`) so it is
+  not counted twice, or it is a consequence (`SIBLING_FILE_REJECTED`). A code
+  with no classification raises, so a new reason code cannot escape the report.
+- **ERROR: the batch is rejected, the row is quarantined, or the version is
+  flagged and excluded from analytics (for invariants: the run fails).**
+  - *File and batch checks (Task 1):* `MANIFEST_VALID`, `FILE_SHA256_MATCH`,
+    `FILE_ENCODING_VALID`, `FILE_CSV_PARSEABLE`, `RECORD_SHAPE_VALID`,
+    `SCHEMA_CONTRACT_MATCH`, `ROW_COUNT_MATCH`. A failure rejects the whole
+    batch. Why:
+    - required by the brief: manifest row-count and SHA-256 validation before
+      loading, an unknown schema change stops the batch, and a batch is
+      all-or-nothing;
+    - our Stage 1 decision: an invalid encoding, a CSV parsing failure or a
+      malformed record shape also rejects the batch. This is an
+      implementation judgment: such a file cannot be safely trusted row by
+      row.
+  - *Row checks (the Task 4 row quarantine):* `SOURCE_RECORD_ID_PRESENT`,
+    `LAST_UPDATED_TS_VALID`, `VERSION_CONFLICT_SAME_TS`. Why: such a row cannot
+    be placed in version order, or would give one version two different
+    values.
+  - *Version checks:* `FACILITY_RESOLVED` and `ADMIT_DATE_VALID`. Why:
+    - an unresolved facility: the brief sends rows whose facility cannot be
+      resolved to quarantine;
+    - an unusable admit date: a design judgment, not a rule stated by the
+      brief. The main analytical uses depend on it: the reporting month
+      (queries 1 and 5, `dim_date`), the point-in-time provider, the age band
+      at admission, the length of stay and the Task 7 year filter. Without it
+      the encounter cannot be placed in any period. The age-band, provider and
+      length-of-stay reason codes for an unusable admit date are classified
+      as derivatives of this check.
+  - *The publish gate:* `PUBLISH_GATE`.
+- **WARNING: the record is kept and flagged.** The severity rationale below
+  is a design judgment; the brief only defines a warning as kept and flagged.
+  - *Version checks:* every other version check (discharge date, discharge
+    before admit, encounter type, claim status and payer mapping, diagnosis
+    valid and in the reference, NPI valid and in the roster, billed amount,
+    ambiguous local timestamp, patient key present, patient linked, age band,
+    sex, ZIP3, provider on the roster at admit). Why: the value is NULL with
+    its reason or flagged, and a version with only WARNINGs is kept and
+    flagged, because it can still be counted correctly. For example, query 1
+    counts an encounter with an invalid amount, and its sum skips the NULL
+    amount.
+  - *`STALE_REPLAY_CONFLICT`:* a stale replay whose values differ from the
+    held version. Why: a stale replay cannot change the current state
+    (Task 4).
+  - *`DUPLICATE_FILE`:* an accepted file whose exact bytes were ingested in an
+    earlier batch. Why: the duplicate delivery is informational; its rows
+    classify as duplicate or stale and change no modeled state (Task 4,
+    Redelivery).
+  - *`SCHEMA_VERSION_CHANGED`:* an accepted file whose matched schema version
+    differs from its source system's previous accepted file. Why: the file
+    matched a registered contract version, so it is valid; the change is
+    flagged so it stays visible.
+- **INFO: a count, not a defect:** `DUPLICATE_ROW`, `STALE_ROW`,
+  `RECON_CURRENT_ROWS`.
+- **Pipeline invariants** are ERRORs whose failure is a pipeline bug, not a
+  data finding: fact foreign keys, current state matching history,
+  value/reason consistency, key uniqueness, row counts reconciled across
+  layers, and a rejected batch leaving nothing loaded. A failure raises inside
+  the mart rebuild transaction, so the mart and DQ tables roll back and the
+  run exits 1. Stored invariant rows are therefore always PASS.
+- **Result:** 50 versions have an ERROR (32 `FACILITY_RESOLVED`, 18
+  `ADMIT_DATE_VALID`), and there are 1,169 WARNING issues on versions. No row
+  needed the Task 4 row quarantine.
+
+### Version issues and the analytics exclusion
+- **`clean.version_dq_issues`** has one row per (`version_key`, `check_code`)
+  that a version fails, with the reason code and severity. Lineage is the
+  version's first arrival. It holds keys, codes and severities only, no
+  values.
+- **A version with an ERROR is not deleted or changed.** It stays in the
+  history and the facts, and in the current state when it is the latest.
+  Queries 1 and 5 and the Task 7 export exclude it by joining this table, with
+  no fallback to an older version (the Task 4 decision).
+- **The table is rebuilt on every run,** inside the mart rebuild transaction,
+  because `clean.encounter_patients` is rebuilt on every run and a re-link can
+  change a version's patient warnings.
+
+### Publish gate
+- **The rule.** A batch is published only if its share of error rows is not
+  more than the threshold, `DQ_GATE_MAX_ERROR_SHARE`:
+  - error rows are received rows that fail an error-level row or version
+    check, including every duplicate or stale copy of a version with an ERROR;
+  - received rows are every raw row of the batch;
+  - the batch fails when `error_rows > threshold × received_rows`, in exact
+    `Decimal` arithmetic; a batch exactly at the threshold passes;
+  - WARNINGs never count.
+- **Where it runs.** Inside the batch transaction, after the history step and
+  its reconciliation, before the audit rows are written. It reads version
+  ERRORs only from the cleaned fields, using the same classification that
+  builds `clean.version_dq_issues`, so the two cannot disagree.
+- **On failure** the whole batch transaction rolls back. A second, small
+  transaction records every file as REJECTED with
+  `DQ_GATE_FAILED(error_rows=..,received=..,threshold_pct=..)` and keeps the
+  failing rows in `ops.gate_rejected_issues` (lineage, `source_record_id` and
+  codes; insert-only, because it is the only record of those rows). The
+  rejection is a data outcome: processing continues with the next batch and
+  the run exits 0.
+- **The threshold is 5%** (`DQ_GATE_MAX_ERROR_SHARE=0.05`, the code default
+  and the value in `.env.example`).
+  - It is a design judgment. The threshold itself is not a measured value,
+    and the brief does not give one; it asks for a threshold that batches
+    001–003 pass.
+  - Rationale (design judgment): roughly three times (5% ÷ 1.54% ≈ 3.2) the
+    highest error share observed in an accepted batch (batch_001: 1.54%),
+    giving headroom for normal variation while still detecting a systemic
+    quality failure.
+  - Observed shares: batch_001 44 of 2,863 rows (1.54%), batch_002 5 of 585
+    (0.85%), batch_003 1 of 188 (0.53%). batch_004 is rejected by Task 1
+    validation and never reaches the gate (`NOT_EVALUATED`).
+- **The tests prove the gate works** (`tests/test_publish_gate.py`). A bad
+  synthetic batch, with 2 of its 10 rows at an unresolved facility (20% > 5%),
+  is rejected with `DQ_GATE_FAILED(error_rows=2,received=10,threshold_pct=5.00)`.
+  Other tables stay unchanged, the failing rows are kept with lineage and
+  codes, the batch appears in the quarantine and the DQ report, and the next
+  batch is still processed. Further tests cover the boundary (at a 10%
+  threshold, 1 of 10 passes and 2 of 10 fail), that warnings never count, that
+  Task 4 quarantined rows count, and that every copy of an error version
+  counts.
+- **Published data is not withdrawn when the rules change.** If a published
+  batch would fail the gate under today's threshold or reference data,
+  `--rebuild-derived` fails and rolls back (exit 1), and a normal run keeps
+  the batch published but reports `PUBLISH_GATE` as FAIL for it in the DQ
+  report.
+- **Logging** follows Stage 1, "Logging and PHI". The gate logs
+  `publish_gate_evaluated` and, on failure, `batch_rejected` with reason code
+  `DQ_GATE_FAILED`; the events carry counts and codes, no PHI or data values.
+
+### Quarantine (`ops.quarantine`)
+- **One table of every rejected or unresolved record,** rebuilt on every run
+  from what earlier steps store:
+
+  | Level / source | What it is | Lineage |
+  | --- | --- | --- |
+  | FILE / BATCH_VALIDATION | a file of a batch rejected by Task 1 | batch, file; `row_count` = rows received |
+  | FILE / PUBLISH_GATE | a file of a batch the gate rejected | batch, file; `row_count` = rows received |
+  | ROW / PUBLISH_GATE | a failing row of a gate-rejected batch | batch, file, row |
+  | ROW / HISTORY_ORDERING | a Task 4 row with outcome QUARANTINED | batch, file, row |
+  | VERSION / VERSION_DQ | a version with an ERROR | first arrival, plus `version_key` |
+
+- **A rejected file stands for all its rows.** Its rows are not listed one by
+  one, because a rejected file's records are not trusted (batch_004's Epic
+  file is truncated).
+- **A version ERROR is listed once,** at its first arrival, with
+  `is_current_version`; its duplicate and stale copies are already counted in
+  the audit.
+- **No values:** lineage, keys, `source_record_id`, codes and, for a FILE
+  entry, the PHI-free audit reason text.
+- **Result:** 53 entries: the 3 files of batch_004 and 50 ERROR versions.
+
+### DQ report (`ops.dq_report`)
+- **One row per (batch, file, check),** including checks with nothing to
+  report, so the report shows that every check ran. Batch-scope rows
+  (`MANIFEST_VALID`, `PUBLISH_GATE`, `REJECTED_BATCH_NOT_LOADED`) have no file.
+- **Status:** PASS; FAIL for an ERROR check or WARN for a WARNING check with
+  failures; NOT_EVALUATED where an earlier failure stopped the check. In a
+  rejected batch, the Task 1 checks are evaluated and every other file check
+  is NOT_EVALUATED with `BATCH_REJECTED`.
+- **Special cases:**
+  - a gate-rejected batch: its error-level row and version checks are counted
+    on rows from `ops.gate_rejected_issues`, because the batch transaction,
+    and with it the versions, was rolled back;
+  - a batch rejected at the manifest has no file list, so it gets only the
+    batch-scope rows. A batch rejected by file validation, such as batch_004,
+    still gets its per-file rows.
+- **Counts:** `evaluated_count` (the population checked), `observed_count`,
+  `expected_count` (reconciliation checks only), `observed_pct` and, for the
+  gate, `threshold_pct`.
+- **Row counts are reconciled across layers** for every accepted file: raw
+  rows, row outcomes, patient rows, history rows, version-field rows, fact
+  rows, the DQ partition and quarantine rows.
+- **Deterministic:** rebuilt on every run with no run timestamps, so the same
+  state always gives the same rows. Some rows of an earlier batch change
+  legitimately when a later batch arrives, for example `RECON_CURRENT_ROWS`
+  as versions are superseded.
+- **Exported as `dq_report.csv`;** the brief allows CSV or Markdown.
+
 ## Task 7: chronic_acute_encounters.csv
 
 Implemented in `chronic_acute_export.py` and written by every run after the
@@ -803,12 +994,81 @@ changes no row).
   rename. The file is byte-identical across incremental, one-shot, rerun and
   rebuild runs.
 
-## Approved for later groups (not implemented yet)
+## Task 8: Docker
 
-- **The Docker container runs as root**, with no `USER` directive. A
-  bind-mounted `./output` owned by a different user on a Linux host could make
-  a non-root container fail to write, which would break the required exit
-  code 0 on the assessor's machine. The cost is less privilege separation
-  inside the container; in production the job would run as a dedicated
-  non-root identity with storage permissions set to match. `Dockerfile` and
-  `docker-compose.yml` are still empty; this applies when Docker is built.
+### Image and services
+- **One image, two Compose services.** `pipeline` runs `python -m
+  pipeline.main` and is what `docker compose up --build` starts. `tests` runs
+  pytest in the same image and sits in the `test` profile, so `up` never
+  starts it; `docker compose run --rm --build tests` does. One image means the
+  tests run against exactly the code and dependency versions that produce the
+  outputs.
+- **`python:3.11.17-slim-bookworm`, pinned to the patch release.** 3.11
+  matches local development (the code needs 3.11+ for `datetime.UTC`).
+- **`/app` mirrors the repository layout** (`src/`, `config/`, `sql/`,
+  `tests/`, `pytest.ini`, `.env.example`), so `config.REPO_ROOT` and the tests'
+  `REPO_ROOT` resolve to `/app` and nothing in the code is Docker-specific.
+  Files are copied explicitly; `.dockerignore` also keeps `.env`, `.git`,
+  `.venv`, `data/`, `output/` and DuckDB files out of the build context.
+- **Exec-form `CMD`.** Python is PID 1, so the container's exit code is the
+  pipeline's: 0 for a completed run, rejected batches included; 1 for a
+  configuration or system failure. Compose adds no wrapper and no restart
+  policy.
+- **The container runs as root**, with no `USER` directive. A bind-mounted
+  `./output` owned by a different user on a Linux host could make a non-root
+  container fail to write, which would break the required exit code 0 on the
+  assessor's machine. The cost is less privilege separation inside the
+  container, and root-owned output files on Linux hosts; in production the job
+  would run as a dedicated non-root identity with storage permissions set to
+  match.
+
+### Storage
+- **The data pack is a read-only bind mount** (`./data:/app/data:ro`) in both
+  services, as the brief requires. It is not copied into the image, so new
+  batches dropped into `data/landing` are picked up without a rebuild.
+- **Outputs are a bind mount** (`./output:/app/output`), so the CSVs land
+  directly in the repository's `output/` folder.
+- **The raw DuckDB database is on a tmpfs at `/work`, not a named volume.**
+  Every container start begins with an empty database and processes
+  `batch_001` to `batch_004` from scratch. A persistent volume was rejected:
+  - a repeated `docker compose up --build` would skip all four batches as
+    already processed, so the run would no longer process them;
+  - the volume outlives code changes (`git pull`, rebuilds, even a re-clone
+    into a folder with the same name), so accepted batches would keep derived
+    state built by older code, never be re-evaluated against new reference
+    data or gate settings, and a pre-Task-4 database would make the run exit 1;
+  - raw PHI would stay in Docker storage after the run.
+
+  The container's writable layer and anonymous volumes were also rejected:
+  `docker compose up` restarts an unchanged existing container and keeps
+  anonymous volumes on recreate, so neither is reliably empty. The cost is that
+  the Docker run does not show incremental loading across runs; within a run
+  each batch is still its own transaction, and incremental-vs-rebuild
+  equivalence is proven by `tests/test_incremental_parity.py`, as the brief
+  asks. In production the raw layer is persistent, access-controlled storage.
+- **The DuckDB file is not exported.** The brief makes it optional, and the
+  raw layer holds PHI; `RAW_DB_PATH` must be outside `OUTPUT_DIR` anyway.
+
+### Configuration and secrets
+- **Compose loads `.env.example`, then an optional `.env`** (`env_file` with
+  `required: false`, which needs Compose 2.24+). The development-only HMAC key
+  therefore exists only in `.env.example`, where the brief allows a clearly
+  labelled one, and not as a second committed copy in `docker-compose.yml`. A
+  fresh clone runs with no `.env`; a real key goes in the gitignored `.env`,
+  whose values win. Shell variables do not override `env_file` values; that is
+  accepted, since `.env` is the documented override.
+- **Container paths are fixed in `docker-compose.yml`**, not read from the env
+  files, so an override cannot move the raw database off the tmpfs or into the
+  output folder. Only `PATIENT_KEY_HMAC_SECRET`, `LOG_LEVEL` and
+  `DQ_GATE_MAX_ERROR_SHARE` are meant to be changed.
+- **The `tests` service gets no pipeline variables.** The tests build their own
+  settings; one starts the pipeline as a subprocess with the inherited
+  environment, and nothing from the pipeline service can leak into it.
+
+### Dependencies
+- **Every package in `requirements.txt` is pinned** to an exact version,
+  including pytest's own dependencies (`colorama` only on Windows, by marker),
+  and the Python base image uses the pinned `python:3.11.17-slim-bookworm`
+  tag. No new packages were added; the pins
+  record the versions already used locally. pytest is in the image because the
+  brief requires the tests to run in a container.

@@ -1,0 +1,40 @@
+# docker compose up --build               processes every batch in data/landing, writes ./output
+# docker compose run --rm --build tests   runs the test suite in the same image
+#
+# Configuration: .env.example supplies the development-only defaults, including
+# the dev-only HMAC key; an optional, gitignored .env overrides any of them.
+# Container paths are fixed below and are not meant to be overridden.
+
+services:
+  pipeline:
+    build: .
+    image: skypoint-pipeline:local
+    env_file:
+      - path: .env.example
+      - path: .env
+        required: false
+    environment:
+      DATA_DIR: /app/data
+      REFERENCE_DIR: /app/data/reference
+      OUTPUT_DIR: /app/output
+      RAW_DB_PATH: /work/raw.duckdb
+      SCHEMA_CONTRACT_PATH: /app/config/schema_contracts.json
+      FACILITY_ALIASES_PATH: /app/config/facility_aliases.json
+    volumes:
+      - ./data:/app/data:ro
+      - ./output:/app/output
+    # The raw DuckDB layer (raw PHI) lives in memory and is emptied on every
+    # container start, so each run processes batch_001..batch_004 from scratch
+    # and no raw PHI is left behind on the host or in a Docker volume.
+    tmpfs:
+      - /work
+
+  tests:
+    build: .
+    image: skypoint-pipeline:local
+    # Only started when named: `docker compose up` runs the pipeline alone.
+    profiles: ["test"]
+    command: ["python", "-m", "pytest", "-p", "no:cacheprovider"]
+    # The tests read the real data pack (read only) and write only to temp dirs.
+    volumes:
+      - ./data:/app/data:ro

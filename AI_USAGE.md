@@ -1,7 +1,7 @@
 # AI usage
 
 ## Tools and how I used them
-- **Claude Code (VS Code extension, Opus 5.5)**: wrote the Stage 1 code and tests, and the Task 2 parsers (D0/D1). I ran it in plan mode first, then in manual-approval mode with no auto mode. Stage 1 was built in four reviewed groups. I read each diff before accepting it and committed each group myself.
+- **Claude Code (VS Code extension, Opus 5.5)**: wrote the Stage 1 code and tests, and the Task 2 parsers (D0/D1); its work on later tasks and on the documentation is recorded in the sections below. I ran it in plan mode first, then in manual-approval mode with no auto mode. Stage 1 was built in four reviewed groups. I read each diff before accepting it and committed each group myself.
 - **Claude chat and ChatGPT**: used for planning, prompt drafting, command help and as a second opinion on Claude Code's output. I treated their advice as suggestions and checked it against the brief and the data.
 
 ## Where it saved time
@@ -29,10 +29,10 @@
 - **Logger lost under `python -m`.** Its first `main.py` used `logging.getLogger(__name__)`. Under `python -m pipeline.main`, `__name__` is `"__main__"`, which is outside the configured `pipeline` logger, so `pipeline_started`, `pipeline_finished` and `pipeline_failed` would never have reached the JSON log. The in-process tests could not see this; its subprocess test caught it before I reviewed the group. The logger is now named `pipeline.main` explicitly.
 
 ## Where I overrode it
-- **Container user:** its plan ran the container as non-root UID 1000. I switched to root, because a bind-mounted `./output` owned by another user on a Linux host could fail the run and break the required exit code 0. The trade-off is recorded in DECISIONS.md; Docker itself is not built yet.
+- **Container user:** its plan ran the container as non-root UID 1000. I switched to root, because a bind-mounted `./output` owned by another user on a Linux host could fail the run and break the required exit code 0. The trade-off is recorded in DECISIONS.md (Task 8: Docker), and the Dockerfile has no `USER` directive.
 - **Missing columns:** I required NULL, not an empty string, for a canonical column a schema version lacks (for example `encounter_source` before Athena v2). An empty string is stored only when the field was delivered empty.
 - **Auto mode:** I declined the "auto mode" and "allow all edits" options on every prompt.
-- **Docs after code:** I scheduled README and DECISIONS to be written after the code they describe. DECISIONS.md now covers Stage 1 and the Task 2 parsers; README.md and ARCHITECTURE.md are still to come.
+- **Docs after code:** I scheduled README and DECISIONS to be written after the code they describe. README.md, ARCHITECTURE.md and DECISIONS.md now cover the work through Task 8 (see "Documentation" below).
 
 ## What I verified myself
 - Compared the manifest hash of every file in my `data/` copy and again in a fresh clone. 11 files match, and only the batch_004 Epic file mismatches, as intended.
@@ -183,3 +183,91 @@ Claude Code raised these three points after group (a). I approved its proposal f
 - Same-timestamp conflicts (`VERSION_CONFLICT_SAME_TS`) count in `quarantined_count`, so that received = accepted + duplicate + stale + quarantined still holds.
 - `accepted_count` excludes stale rows that create a history version. They are counted as stale, and `history_rows_written` reconciles the difference.
 - A stale replay whose values differ from the held version stays `STALE`, with `match_type = CONFLICT`, because the stale check runs first.
+
+## Task 6: data quality and observability
+
+### What it did
+- Claude Code implemented the DQ check catalogue and its severity mapping (`dq_rules.py`), the publish gate, the version-level issues, the quarantine and the DQ report, with their tests (commits `be244cf` and `bedac3b`).
+- When I later had it document Task 6 in DECISIONS.md, it wrote the section from the code and tests: the severity of every check, the gate rule, the quarantine levels and the DQ report, with counts read from the generated outputs.
+
+### Decisions I made, not the AI
+- **The 5% publish-gate threshold is my design judgment.** It is not a requirement of the brief, which only asks for a threshold that batches 001-003 pass, and not something the AI derived. My rationale: roughly three times the highest error share of an accepted batch (batch_001, 1.54%).
+- **Requirements and judgments are kept apart.** I required DECISIONS.md to say which reasons come from the brief and which are our design judgments: the admit-date ERROR, the rationale for WARNINGs, and rejecting a batch for an undecodable, unparseable or malformed file.
+
+### Corrections
+- **An unrecorded rationale.** No document or commit gave the reason for treating an unusable admit date as an ERROR. It wrote one from dependencies in the code and flagged that it had done so. I had it marked as a design judgment, and its "every analytical use depends on it" narrowed to "the main analytical uses".
+- **Its consistency review of its own section** found three reasons written as if the brief required them (the admit date, the warnings, the file-level rejections) and two gaps (`SCHEMA_VERSION_CHANGED` was not defined; the DQ report's special cases were missing). All were corrected.
+- **A claim I removed.** At my request it added "Status: approved in design review" to match Tasks 4 and 5, and noted that it could not verify such a review. I removed the line.
+- **One of my instructions was wrong.** I asked it to document that a batch rejected at file validation gets only batch-scope DQ report rows. It checked the code and the outputs (batch_004 has 153 file-scope rows) and documented the actual behaviour: only a batch rejected at the manifest gets batch-scope rows only.
+
+## Task 7: chronic_acute_encounters.csv
+
+### What it did
+- Claude Code implemented the export (`chronic_acute_export.py`) and its tests (commit `9039e06`), including the check that the file is byte-identical across incremental, one-shot, rerun and rebuild runs.
+
+### Decisions
+- The rules are recorded in DECISIONS.md, Task 7: the brief's six conditions, the Task 6 ERROR exclusion as in queries 1 and 5, a NULL claim status kept, the 30-day readmission search over all current encounters, point-in-time provider attributes and first-arrival lineage. DECISIONS.md does not mark them as approved.
+- Two implementation choices are still open for my review: what "valid dates" means for the follow-up encounter, and using a row's own `discharge_date` as stored when it is before its admission.
+
+## Task 8: Docker
+
+### How I ran it
+- Three steps, each ending with a stop for my approval: a read-only inspection and design, a second read-only review of that design against the assessment PDF, then the implementation. Claude Code did not build the image, run the containers or commit anything; I ran the verification.
+
+### Where it saved time
+- Found what `docker compose up --build` was missing: `Dockerfile`, `docker-compose.yml` and `README.md` were empty, there was no `.dockerignore`, and a fresh clone with no `.env` had no source for the required `PATIENT_KEY_HMAC_SECRET`, so the run would exit 1.
+- Confirmed the application needed no Docker-specific change: every path is an environment variable, the batch_004 rejection already exits 0, and the tests only read the data pack and write to temp folders, so a read-only mount works.
+- Checked which tests depend on the repository layout (`REPO_ROOT / "data"`, `sql/`, `.env.example`) and laid the image out at `/app` to match, so the tests run unchanged in the container.
+- Looked up the newest published `python:3.11.x-slim-bookworm` tag (3.11.17) with read-only manifest checks, to pin the base image.
+
+### Corrections: its first design
+I had it re-check its first design against the assessment PDF before implementing anything. That review found that the first design:
+- had no tests container and excluded `tests/` from the image, although Task 8 requires the tests to run in a container with one documented command;
+- kept the raw DuckDB database in a persistent named volume. A repeated `docker compose up --build` would then skip all four batches as already processed, the volume would outlive code changes (a pre-Task-4 database there makes the run exit 1), and raw PHI would stay in Docker storage after the run;
+- set the development-only HMAC key as a default in `docker-compose.yml`, a second committed copy that the brief does not allow for (it allows a labelled one in `.env.example`);
+- mounted the data pack at `/data`, which would break the tests' `REPO_ROOT / "data"` path.
+
+### Decisions I made, not the AI
+- The dev-only key lives only in `.env.example`. Compose loads that file, then an optional, gitignored `.env` that overrides it; the key is never in `docker-compose.yml`.
+- The raw DuckDB database is on a tmpfs at `/work`, empty on every pipeline run, so no raw-data state persists locally between runs. No persistent volume.
+- No new dependencies: the existing pinned set stays, and the only change is pinning pytest's own dependencies at the versions already installed.
+- Two Compose services, `pipeline` and `tests`; `./data` mounted read-only, `./output` read-write.
+- Scope of the Task 8 step: README gets only the Task 8 sections, ARCHITECTURE.md is unchanged, and the generated outputs are committed separately after verification. README and ARCHITECTURE.md were completed later (see "Documentation").
+- The container runs as root. Its plan used non-root UID 1000; I changed it because a bind-mounted `./output` owned by another user could make the run fail and break the required exit code 0 (see "Where I overrode it").
+
+### Unplanned but necessary change
+- It added `.env.example text eol=lf` to `.gitattributes`, outside the file list I approved, and said so in its report. Compose now reads `.env.example` directly, and a CRLF checkout on Windows could otherwise put a carriage return into the HMAC key and change every `patient_key`. The edit also removed a stray carriage return from the existing `Dockerfile text eol=lf` line.
+
+### Its own errors, found in review
+At my request it reviewed its Task 8 files against the brief. It found three inaccuracies in its own work, and I had them corrected:
+- the README clone command still had a placeholder URL;
+- the `config.py` docstring said Docker sets every value in `docker-compose.yml`, but three come from `.env.example`;
+- DECISIONS.md said "every installed package is pinned", which overstated it: the packages in `requirements.txt` and the base image tag are pinned.
+
+### What I verified myself
+- `docker compose up --build` exited with code 0. batch_001-003 were accepted and batch_004 was rejected, and the rejection did not change the exit code.
+- A second `docker compose up` also exited with code 0.
+- `./output` held all 17 CSV files.
+- `docker compose run --rm --build tests` passed 1038 of 1038 tests inside the container.
+
+## Documentation: README, ARCHITECTURE and DECISIONS
+
+### What it did
+- **README.md:** drafted the Task 8 sections, then the rest: overview, an architecture diagram with the PHI boundary, the repository layout, the six example queries, assumptions and known limitations. It copied the queries from `sql/` and checked them byte for byte against the files.
+- **ARCHITECTURE.md:** compared the old file with the brief. It covered only Task 4 and had six problems: a future-tense statement about implemented behaviour, an incomplete description of the batch transaction, a scale claim that ignored the per-run rebuilds, a hypothetical parity test that could be confused with the existing one, an absolute claim about Databricks transactions, and a Task 4-only scope. It then rewrote the document, and I had it trimmed from 526 to 415 lines.
+- **DECISIONS.md:** added the Task 6 section and reviewed it for consistency (see Task 6).
+
+### Decisions I made, not the AI
+- I had every document checked against the assessment PDF before it was changed.
+- **Current vs proposed.** The current implementation (Python and DuckDB in Docker) and the proposed production design are kept clearly apart, and every production section is labelled as proposed.
+- **Platform.** Azure Databricks is the primary platform, with Snowflake in one sentence, and Databricks Workflows with a file-arrival trigger, with Azure Data Factory as the alternative.
+- **No unsupported production claims.** No production control (access control, masking, encryption, CI/CD) is presented as implemented, and SLA numbers are labelled as proposed targets.
+- **README.** No rationale for the 5% threshold in the README, and an explicit PHI boundary in its diagram: `raw.encounters` is the only persisted PHI.
+
+### AI choices I reviewed
+- Drafts it wrote for my review, not decisions: the proposed SLA targets, the six-week plan for three engineers and the pull-request checklist.
+- From four candidate risks I gave it, it chose three for the top-three list and covered `patient_key` changes during key rotation in the PHI governance section instead.
+
+### Corrections
+- **Unverified claims flagged.** Its README review marked a claim it could not yet support: that a repeat run changes only the run timings. The claim stayed only after it found the evidence in `test_incremental_parity.py`, which compares the CSVs excluding only `start_time` and `end_time`.
+- **A mismatch in my own request.** The SQL file names in my README request did not match the repository. It used the real files.

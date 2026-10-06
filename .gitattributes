@@ -1,3 +1,4 @@
 data/** -text
 *.sh text eol=lf
 Dockerfile text eol=lf
+.env.example text eol=lf

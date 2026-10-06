@@ -1,0 +1,28 @@
+# Secrets: a local .env must never reach the image (.env.example is copied on purpose)
+.env
+
+# Data and generated state: the data pack and ./output are mounted at run time;
+# DuckDB files may hold raw PHI
+data/
+output/
+work/
+*.duckdb
+*.duckdb.wal
+
+# Version control, virtualenvs, caches
+.git/
+.venv/
+**/__pycache__/
+**/*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# IDE and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log
