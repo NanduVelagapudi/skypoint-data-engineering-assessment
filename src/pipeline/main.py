@@ -2,9 +2,13 @@
 
 Processes every pending landing batch in order (each accepted batch also adds
 its rows to the encounter history, Task 4, and the cleaned Task 2 fields of its
-new versions to clean.encounter_version_fields), rebuilds the PHI-free
-clean.encounter_patients table (Task 3) and the mart tables (Task 5), then
-exports output/batch_audit.csv and one CSV per PHI-free clean and mart table.
+new versions to clean.encounter_version_fields). A batch that passes
+validation is still rejected when more than DQ_GATE_MAX_ERROR_SHARE of its rows
+fail error-level DQ checks (the Task 6 publish gate). Then it rebuilds the
+PHI-free clean.encounter_patients table (Task 3), the mart tables (Task 5) and,
+in the same transaction, the DQ tables clean.version_dq_issues, ops.quarantine
+and ops.dq_report (Task 6), and exports output/batch_audit.csv and one CSV per
+PHI-free clean and mart table.
 
 --rebuild-derived first rebuilds the Task 4 history and audit counts from the
 raw layer, replaying every accepted batch through the same step as an
@@ -15,8 +19,8 @@ Exit codes:
   0  the run completed, including when batches were rejected (a data outcome)
   1  a pipeline/system failure: bad configuration (including a missing
      PATIENT_KEY_HMAC_SECRET), missing landing folder, unwritable database or
-     output, a database from before Task 4 without --rebuild-derived, or any
-     unexpected exception
+     output, a database from before Task 4 without --rebuild-derived, a failed
+     DQ pipeline invariant, or any unexpected exception
   2  unknown command-line arguments
 """
 
@@ -68,10 +72,12 @@ def run(settings: Settings, secret: bytes, rebuild_derived_state: bool = False) 
     con = open_store(settings.raw_db_path, contracts.canonical_columns, allow_outdated_audit=rebuild_derived_state)
     try:
         if rebuild_derived_state:
-            rebuild_derived(con, conventions, reference)
-        results = run_pending_batches(con, settings.landing_dir, contracts, conventions, reference)
+            rebuild_derived(con, conventions, reference, settings.dq_gate_max_error_share)
+        results = run_pending_batches(
+            con, settings.landing_dir, contracts, conventions, reference, settings.dq_gate_max_error_share
+        )
         build_encounter_patients(con, conventions, secret)
-        rebuild_mart(con, warehouse_reference)
+        rebuild_mart(con, warehouse_reference, conventions, settings.dq_gate_max_error_share)
         export_csv(con, settings.output_dir / AUDIT_CSV_NAME)
         export_tables(con, settings.output_dir)
     finally:

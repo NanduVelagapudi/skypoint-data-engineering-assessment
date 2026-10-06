@@ -10,6 +10,14 @@ record shape, row count). Only then is the batch written, in one transaction:
 * any file failed: only REJECTED audit rows. Failed files carry their own
   reason codes; the files that passed carry SIBLING_FILE_REJECTED.
 
+Task 6 publish gate: after the history step and its reconciliation, still
+inside the batch transaction, the gate counts the batch's rows that fail
+error-level DQ checks. If they are more than the threshold share
+(DQ_GATE_MAX_ERROR_SHARE), the whole transaction rolls back and, in a second
+small transaction, every file gets a REJECTED audit row with
+DQ_GATE_FAILED(error_rows=..,received=..,threshold_pct=..) (batch totals) and
+the failing rows go to ops.gate_rejected_issues. Nothing else is written.
+
 The history step classifies only the batch's own rows against the history of
 the encounters they touch; nothing else is recomputed. If a file's counts do
 not reconcile, the transaction rolls back and the run fails.
@@ -22,7 +30,10 @@ processed batch folder whose files have changed is skipped as before, with a
 warning in the log. Logs carry allow-listed keys only and never row values.
 
 rebuild_derived replays the same per-batch history step over raw, in batch_id
-order; it is also how a database from before Task 4 is migrated.
+order; it is also how a database from before Task 4 is migrated. It applies
+the gate too: a published batch that the current rules would reject fails the
+rebuild (PipelineError, everything rolls back), because published data cannot
+be un-published without a manual reset.
 """
 
 from __future__ import annotations
@@ -33,14 +44,23 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 
 import duckdb
 
-from pipeline import batch_audit, encounter_history, raw_store, version_fields
+from pipeline import batch_audit, encounter_history, publish_gate, raw_store, version_fields
 from pipeline.batch_audit import RECONCILED, AuditRow, BatchStatus, processed_batch_ids
+from pipeline.config import DEFAULT_DQ_GATE_MAX_ERROR_SHARE
 from pipeline.csv_reader import parse_csv
-from pipeline.errors import BatchRejected, PipelineError, ReasonCode, ValidationFailure, format_reasons
+from pipeline.errors import (
+    BatchRejected,
+    PipelineError,
+    PublishGateFailed,
+    ReasonCode,
+    ValidationFailure,
+    format_reasons,
+)
 from pipeline.manifest import (
     MANIFEST_FILE_NAME,
     Manifest,
@@ -105,6 +125,7 @@ def run_pending_batches(
     contracts: SchemaContracts,
     conventions: Mapping[str, SourceConventions],
     reference: CleaningReference,
+    max_error_share: Decimal = DEFAULT_DQ_GATE_MAX_ERROR_SHARE,
 ) -> list[BatchResult]:
     """Process every batch that has no batch_audit row yet, in batch_id order.
 
@@ -113,6 +134,7 @@ def run_pending_batches(
     """
     encounter_history.ensure_tables(con)
     version_fields.ensure_table(con)
+    publish_gate.ensure_table(con)
     if version_fields.missing_count(con):
         raise PipelineError(
             "encounter versions without cleaned fields; run python -m pipeline.main --rebuild-derived"
@@ -124,7 +146,7 @@ def run_pending_batches(
             log.info("batch_already_processed", extra={"step": "discover", "batch_id": batch_dir.name})
             _warn_if_redelivered_with_changes(con, batch_dir)
             continue
-        results.append(process_batch(con, batch_dir, contracts, conventions, reference))
+        results.append(process_batch(con, batch_dir, contracts, conventions, reference, max_error_share))
     return results
 
 
@@ -157,6 +179,7 @@ def process_batch(
     contracts: SchemaContracts,
     conventions: Mapping[str, SourceConventions],
     reference: CleaningReference,
+    max_error_share: Decimal = DEFAULT_DQ_GATE_MAX_ERROR_SHARE,
 ) -> BatchResult:
     batch_id = batch_dir.name
     start = _now()
@@ -202,10 +225,13 @@ def process_batch(
 
     def add_history(con: duckdb.DuckDBPyConnection) -> list[AuditRow]:
         """Runs inside the batch transaction, after the raw rows are written."""
-        final_rows[:] = _classify_into_history(con, batch_id, rows, conventions, reference)
+        final_rows[:] = _classify_into_history(con, batch_id, rows, conventions, reference, max_error_share)
         return final_rows
 
-    raw_store.write_accepted_batch(con, batch_id, files, rows, ingested_at=end, before_audit=add_history)
+    try:
+        raw_store.write_accepted_batch(con, batch_id, files, rows, ingested_at=end, before_audit=add_history)
+    except PublishGateFailed as failure:  # the batch transaction has rolled back
+        return _reject_by_gate(con, batch_id, checks, failure.result, start)
     accepted_rows = sum(row.accepted_count for row in final_rows)
     received_rows = sum(len(f.rows) for f in files)
     _log_outcome(batch_id, BatchStatus.ACCEPTED, accepted_rows, start, end, rows=final_rows)
@@ -218,26 +244,64 @@ def _classify_into_history(
     rows: Sequence[AuditRow],
     conventions: Mapping[str, SourceConventions],
     reference: CleaningReference,
+    max_error_share: Decimal = DEFAULT_DQ_GATE_MAX_ERROR_SHARE,
 ) -> list[AuditRow]:
     """Classify an accepted batch already in raw into the history; return its reconciled audit rows.
 
     The one history step for a batch, inside the caller's transaction: used by
     the incremental load and, batch by batch, by rebuild_derived. It adds the
     batch's row outcomes and new versions, then the cleaned fields of those
-    new versions (insert-only).
+    new versions (insert-only), reconciles the counts, and finally applies the
+    publish gate: PublishGateFailed if the batch must not be published.
     """
     encounter_history.apply_batch(con, batch_id, conventions)
     version_fields.add_batch_fields(con, batch_id, conventions, reference)
     if version_fields.missing_count(con, batch_id):
         raise PipelineError(f"cleaned fields are missing for versions of {batch_id}")
     counts = encounter_history.file_counts(con, batch_id)
-    return [_reconciled(row, counts) for row in rows]
+    reconciled = [_reconciled(row, counts) for row in rows]
+    gate = publish_gate.evaluate(con, batch_id, max_error_share)
+    if gate.failed:
+        raise PublishGateFailed(gate)
+    return reconciled
+
+
+def _reject_by_gate(
+    con: duckdb.DuckDBPyConnection,
+    batch_id: str,
+    checks: Sequence[FileCheck],
+    gate: publish_gate.GateResult,
+    start: datetime,
+) -> BatchResult:
+    """Record a batch the publish gate rejected: REJECTED audit rows and its failing rows, nothing else.
+
+    Every file carries the batch's totals, because the gate decides per batch;
+    the per-file and per-row detail is in ops.gate_rejected_issues. The Task 4
+    columns stay NULL, as for any rejected batch: nothing was kept.
+    """
+    end = _now()
+    reason = (
+        f"{ReasonCode.DQ_GATE_FAILED}(error_rows={gate.error_rows},received={gate.received_rows},"
+        f"threshold_pct={publish_gate.threshold_pct(gate.max_error_share)})"
+    )
+    rows = [
+        replace(_audit_row(batch_id, check, BatchStatus.REJECTED, start, end), reason=reason, accepted_count=0)
+        for check in checks
+    ]
+
+    def store_failing_rows(con: duckdb.DuckDBPyConnection) -> None:
+        publish_gate.insert_rejected_issues(con, gate)
+
+    raw_store.write_rejected_batch(con, batch_id, rows, with_audit=store_failing_rows)
+    _log_outcome(batch_id, BatchStatus.REJECTED, 0, start, end, reason_code=str(ReasonCode.DQ_GATE_FAILED))
+    return BatchResult(batch_id, BatchStatus.REJECTED, 0)
 
 
 def rebuild_derived(
     con: duckdb.DuckDBPyConnection,
     conventions: Mapping[str, SourceConventions],
     reference: CleaningReference,
+    max_error_share: Decimal = DEFAULT_DQ_GATE_MAX_ERROR_SHARE,
 ) -> list[str]:
     """Rebuild the history, cleaned fields and Task 4 audit counts from raw; returns the batch ids replayed.
 
@@ -248,7 +312,8 @@ def rebuild_derived(
     audit columns. Raw rows, file records and every other audit value (status,
     reason, timings) are left as they are. If anything fails, everything rolls
     back, so a pre-Task-4 database stays pre-Task-4 and is still refused by
-    normal runs.
+    normal runs. A published batch that now fails the publish gate (the
+    reference data, aliases or threshold changed) fails the rebuild the same way.
     """
     log.info("derived_rebuild_started", extra={"step": "rebuild"})
     con.begin()
@@ -258,6 +323,7 @@ def rebuild_derived(
             log.warning("batch_audit_migrated", extra={"step": "rebuild"})
         encounter_history.ensure_tables(con)
         version_fields.ensure_table(con)
+        publish_gate.ensure_table(con)
         encounter_history.clear_history(con)
         version_fields.clear(con)
         batch_ids = [r[0] for r in con.execute("SELECT DISTINCT batch_id FROM raw.ingested_files ORDER BY batch_id").fetchall()]
@@ -266,7 +332,16 @@ def rebuild_derived(
             ingested = {r[0] for r in con.execute("SELECT file_name FROM raw.ingested_files WHERE batch_id = ?", [batch_id]).fetchall()}
             if {r.file_name for r in rows} != ingested or any(r.status != BatchStatus.ACCEPTED for r in rows):
                 raise PipelineError(f"audit rows of {batch_id} do not match its ingested files")
-            batch_audit.update_task4_counts(con, _classify_into_history(con, batch_id, rows, conventions, reference))
+            try:
+                reconciled = _classify_into_history(con, batch_id, rows, conventions, reference, max_error_share)
+            except PublishGateFailed as failure:
+                log.error(
+                    "published_batch_fails_gate",
+                    extra={"step": "rebuild", "batch_id": batch_id, "received_count": failure.result.received_rows,
+                           "error_count": failure.result.error_rows, "reason_code": str(ReasonCode.DQ_GATE_FAILED)},
+                )  # fmt: skip
+                raise PipelineError(f"published batch {batch_id} now fails the publish gate") from None
+            batch_audit.update_task4_counts(con, reconciled)
         con.commit()
     except BaseException as exc:
         with contextlib.suppress(duckdb.Error):  # a failed commit may already have rolled back

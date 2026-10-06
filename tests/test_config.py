@@ -1,3 +1,4 @@
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -71,6 +72,26 @@ def test_secret_never_appears_in_settings_repr():
     settings = load_settings({"PATIENT_KEY_HMAC_SECRET": "unit-test-secret-ZZSECRET"})
 
     assert "ZZSECRET" not in repr(settings) and "ZZSECRET" not in str(settings)
+
+
+def test_publish_gate_threshold_defaults_to_5_percent_and_can_be_overridden():
+    assert load_settings({}).dq_gate_max_error_share == Decimal("0.05")
+    assert load_settings({"DQ_GATE_MAX_ERROR_SHARE": " 0.10 "}).dq_gate_max_error_share == Decimal("0.10")
+    assert load_settings({"DQ_GATE_MAX_ERROR_SHARE": "0"}).dq_gate_max_error_share == Decimal("0")
+    assert load_settings({"DQ_GATE_MAX_ERROR_SHARE": "1"}).dq_gate_max_error_share == Decimal("1")
+
+
+def test_env_example_sets_the_default_publish_gate_threshold():
+    lines = (REPO_ROOT / ".env.example").read_text(encoding="utf-8").splitlines()
+    [value] = [line.split("=", 1)[1] for line in lines if line.startswith("DQ_GATE_MAX_ERROR_SHARE=")]
+
+    assert load_settings({"DQ_GATE_MAX_ERROR_SHARE": value}).dq_gate_max_error_share == Decimal("0.05")
+
+
+@pytest.mark.parametrize("value", ["abc", "-0.01", "1.5", "NaN", "Infinity", "5%"])
+def test_an_invalid_publish_gate_threshold_is_refused(value):
+    with pytest.raises(ConfigError, match="DQ_GATE_MAX_ERROR_SHARE"):
+        load_settings({"DQ_GATE_MAX_ERROR_SHARE": value})
 
 
 @pytest.mark.parametrize("env", [{}, {"PATIENT_KEY_HMAC_SECRET": ""}, {"PATIENT_KEY_HMAC_SECRET": "   "}])

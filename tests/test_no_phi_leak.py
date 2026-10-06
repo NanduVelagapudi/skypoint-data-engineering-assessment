@@ -1,4 +1,4 @@
-"""A sentinel PHI-like value must never reach logs, exceptions, audit rows or the audit CSV.
+"""A sentinel PHI-like value must never reach logs, exceptions, audit rows, the audit CSV or the DQ report.
 
 Every failure path that sees delivered content is exercised with the sentinel
 inside that content. The sentinel is also checked to have reached
@@ -92,6 +92,8 @@ def test_sentinel_never_leaves_the_raw_layer(landing_dir, pipeline_env, capsys, 
     try:
         statuses = dict(con.execute("SELECT DISTINCT batch_id, status FROM ops.batch_audit").fetchall())
         audit_text = repr(con.execute("SELECT * FROM ops.batch_audit").fetchall())
+        dq_text = repr(con.execute("SELECT * FROM ops.dq_report").fetchall())
+        dq_report_rows = con.execute("SELECT count(*) FROM ops.dq_report").fetchone()[0]
         raw_hits = con.execute(
             "SELECT count(*) FROM raw.encounters WHERE patient_mrn LIKE ?", [f"%{SENTINEL}%"]
         ).fetchone()[0]
@@ -101,6 +103,7 @@ def test_sentinel_never_leaves_the_raw_layer(landing_dir, pipeline_env, capsys, 
     assert statuses == {"batch_001": "ACCEPTED", **{f"batch_00{i}": "REJECTED" for i in range(2, 8)}}
     assert raw_hits == 9  # the sentinel did reach the restricted raw layer
     assert SENTINEL not in audit_text
+    assert dq_report_rows > 0 and SENTINEL not in dq_text  # every batch, accepted or rejected, is reported
     assert SENTINEL not in (Path(env["OUTPUT_DIR"]) / "batch_audit.csv").read_text(encoding="utf-8")
 
 

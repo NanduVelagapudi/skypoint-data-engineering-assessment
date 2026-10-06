@@ -140,6 +140,10 @@ def pipeline_env(tmp_path: Path, landing_dir: Path) -> dict[str, str]:
         "REFERENCE_DIR": str(REAL_DATA_DIR / "reference"),
         "LOG_LEVEL": "INFO",
         "PATIENT_KEY_HMAC_SECRET": TEST_PATIENT_KEY_SECRET,
+        # Synthetic rows are deliberately invalid ("<column>-x1"), so almost every row fails an
+        # error-level check. 1 means the publish gate never blocks: these tests exercise the
+        # other stages. Gate tests set their own threshold; real-data tests use the 5% default.
+        "DQ_GATE_MAX_ERROR_SHARE": "1",
     }
 
 
@@ -151,6 +155,37 @@ def restore_pipeline_logger():
     yield
     logger.handlers[:] = handlers
     logger.setLevel(level)
+
+
+# --- valid synthetic encounter rows (Task 6 DQ tests) ---
+
+
+@pytest.fixture(scope="session")
+def roster_npi() -> str:
+    """An NPI of the earliest roster snapshot, which covers every 2024 admit date before July."""
+    from pipeline.reference_data import load_warehouse_reference
+
+    earliest = min(load_warehouse_reference(REAL_DATA_DIR / "reference").roster, key=lambda s: s.as_of_date)
+    return sorted(entry.npi for entry in earliest.entries)[0]
+
+
+def epic_file(rows, *, roster_npi: str) -> FileSpec:
+    """An Epic file whose rows are valid apart from the given changes. Patient values are fake."""
+    header = contract_header("EPIC_NORTH")
+    records = []
+    for record_id, changes in rows:
+        values = {
+            "source_system": "EPIC_NORTH", "source_record_id": record_id, "facility_name": "Lakeshore General Hospital",
+            "patient_mrn": f"MRN-zz-{record_id or 'none'}", "patient_first_name": "Testfirst", "patient_last_name": "Testlast",
+            "patient_dob": "01/02/1980", "patient_sex": "F", "patient_zip": "00000", "patient_phone": "000-0000",
+            "admit_date": "03/05/2024", "discharge_date": "03/07/2024", "encounter_type": "IP",
+            "attending_npi": roster_npi, "attending_provider_name": "x", "primary_dx_code": "E11.9",
+            "chief_complaint": "x", "payer_name": "Medicare", "billed_amount": "$5,000.00", "claim_status": "Paid",
+            "last_updated_ts": "2024-03-01T10:00:00Z",
+        }  # fmt: skip
+        values.update(changes)
+        records.append([values.get(column, "") for column in header])
+    return FileSpec("encounters_epic_north.csv", "EPIC_NORTH", csv_bytes(header, records), len(records))
 
 
 # --- database state: pre-Task-4 layout and comparable digests ---
@@ -199,6 +234,10 @@ STATE_TABLES = (
     "mart.dim_patient",
     "mart.fact_encounter_version",
     "mart.fact_encounter_current",
+    "clean.version_dq_issues",
+    "ops.quarantine",
+    "ops.gate_rejected_issues",
+    "ops.dq_report",
 )
 
 
@@ -215,8 +254,8 @@ def attach(db_path: Path):
 def make_pre_task4(db_path: Path) -> None:
     """Turn a pipeline database into what a pre-Task-4 build left behind.
 
-    The history tables, the view, the cleaned version fields and the mart
-    schema (added after Task 4) are dropped, and ops.batch_audit goes back to the
+    The history tables, the view, the cleaned version fields, the mart schema
+    and the DQ tables (added after Task 4) are dropped, and ops.batch_audit goes back to the
     Stage 1 layout with Stage 1 values: accepted_count = rows landed for an
     accepted file, and duplicate, stale and quarantined counts NULL. Raw rows,
     file records, encounter_patients and audit timings are kept as they are.
@@ -227,6 +266,10 @@ def make_pre_task4(db_path: Path) -> None:
         con.execute("DROP TABLE IF EXISTS clean.encounter_versions")
         con.execute("DROP TABLE IF EXISTS clean.encounter_row_outcomes")
         con.execute("DROP TABLE IF EXISTS clean.encounter_version_fields")
+        con.execute("DROP TABLE IF EXISTS clean.version_dq_issues")
+        con.execute("DROP TABLE IF EXISTS ops.dq_report")
+        con.execute("DROP TABLE IF EXISTS ops.quarantine")
+        con.execute("DROP TABLE IF EXISTS ops.gate_rejected_issues")
         con.execute("DROP SCHEMA IF EXISTS mart CASCADE")
         con.execute(STAGE1_AUDIT_DDL)
         con.execute(

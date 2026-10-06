@@ -33,6 +33,8 @@ ALLOWED_EXTRA_KEYS = (
     "duplicate_count",
     "stale_count",
     "quarantined_count",
+    "error_count",
+    "warning_count",
     "reason_code",
     "error_type",
     "status",

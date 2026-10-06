@@ -1,4 +1,7 @@
-"""Task 4 group (c): incremental, one-shot, rerun and rebuild runs on the real data pack agree.
+"""Incremental, one-shot, rerun and rebuild runs on the real data pack agree, with the approved real-data counts.
+
+Started in Task 4 group (c); later groups add their pins here (Task 5 cleaned fields, mart
+dimensions, facts and exports; Task 6 version DQ issues and the DQ report).
 
 The data pack is only read: batch folders are copied into tmp_path for the
 incremental runs. Every database and output folder lives in tmp_path, and the
@@ -24,6 +27,7 @@ import logging
 import shutil
 from collections import Counter
 from datetime import date, datetime
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -40,7 +44,7 @@ from conftest import (
     state_digest,
 )
 
-from pipeline import version_fields
+from pipeline import dq_report, dq_rules, publish_gate, quarantine, version_dq, version_fields
 from pipeline.batch_audit import AUDIT_COLUMNS, TASK4_COLUMNS
 from pipeline.dimensions import VALID_FROM_EARLIEST, ProviderLookup, ProviderRow
 from pipeline.exports import EXPORTED_TABLES, file_name
@@ -53,7 +57,9 @@ REFERENCE = REAL_DATA_DIR / "reference"
 CONVENTIONS = load_source_conventions(REFERENCE / "source_systems_and_facilities.json")
 BATCH_IDS = ("batch_001", "batch_002", "batch_003", "batch_004")
 FINAL_RUNS = ("batch_004", "rerun", "one_shot", "rebuild", "rebuild_live")
-DERIVED_TABLES = tuple(t for t in STATE_TABLES if t != "ops.batch_audit")
+# ops.dq_report and ops.quarantine report every batch, so batch_004 adds its rows there; their other
+# rows are compared separately.
+DERIVED_TABLES = tuple(t for t in STATE_TABLES if t not in ("ops.batch_audit", "ops.dq_report", "ops.quarantine"))
 CSV_RUN_TIME_COLUMNS = ("start_time", "end_time")
 ATHENA, EPIC, MEDITECH = "encounters_athena_clinics.csv", "encounters_epic_north.csv", "encounters_legacy_meditech.csv"
 
@@ -231,11 +237,78 @@ def scd2_rows_from_roster_files() -> int:
     return rows
 
 
+def version_reason_recount(con) -> Counter:
+    """Per version check: the CHECK-classified reason codes in the stored tables, counted without version_dq."""
+    joins = {
+        dq_rules.FIELDS: f"{version_fields.TABLE} x",
+        dq_rules.PATIENTS: "clean.encounter_versions v JOIN clean.encounter_patients x ON x.batch_id = v.first_seen_batch_id "
+                           "AND x.file_name = v.first_seen_file_name AND x.source_row_number = v.first_seen_source_row_number",
+        dq_rules.FACTS: "mart.fact_encounter_version x",
+    }
+    counts = Counter()
+    for source in dq_rules.VERSION_SOURCES:
+        table, _, column = source.partition(".")
+        if table not in joins:  # the re-parsed timestamp warning: none in the data (checked in the profile)
+            continue
+        for code, n in con.execute(f"SELECT x.{column}, count(*) FROM {joins[table]} WHERE x.{column} IS NOT NULL GROUP BY 1").fetchall():
+            classification, check_code = dq_rules.classify(source, code)
+            if classification == dq_rules.Classification.CHECK:
+                counts[check_code] += n
+    return counts
+
+
+def dq_state(con) -> dict:
+    """The DQ tables' contents and checks on them. Nothing here holds PHI (codes, keys and counts only)."""
+    report_columns = ", ".join(dq_report.COLUMNS)
+    issues = version_dq.TABLE
+    return {
+        "issues_by_check": {(b, c): n for b, c, n in con.execute(
+            f"SELECT source_batch_id, check_code, count(*) FROM {issues} GROUP BY ALL").fetchall()},
+        "error_reasons": {(b, c, r): n for b, c, r, n in con.execute(
+            f"SELECT source_batch_id, check_code, reason_code, count(*) FROM {issues} WHERE severity = 'ERROR' GROUP BY ALL").fetchall()},
+        "issue_totals": Counter(dict(con.execute(f"SELECT check_code, count(*) FROM {issues} GROUP BY 1").fetchall())),
+        "recount": version_reason_recount(con),
+        "partition": {(b, s): n for b, s, n in con.execute(f"""
+            WITH w AS (SELECT version_key, max(CASE severity WHEN 'ERROR' THEN 2 ELSE 1 END) r FROM {issues} GROUP BY 1)
+            SELECT v.first_seen_batch_id, CASE w.r WHEN 2 THEN 'ERROR' WHEN 1 THEN 'WARNING' ELSE 'PASS' END, count(*)
+            FROM clean.encounter_versions v LEFT JOIN w USING (version_key) GROUP BY ALL""").fetchall()},
+        "current_error_versions": con.execute(
+            f"SELECT count(DISTINCT version_key) FROM clean.encounter_current JOIN {issues} USING (version_key) "
+            "WHERE severity = 'ERROR'").fetchone()[0],
+        "issue_lineage_unresolved": con.execute(f"""
+            SELECT count(*) FROM {issues} i ANTI JOIN clean.encounter_versions v
+              ON v.version_key = i.version_key AND v.encounter_key = i.encounter_key AND v.source_system = i.source_system
+             AND v.source_record_id = i.source_record_id AND v.first_seen_batch_id = i.source_batch_id
+             AND v.first_seen_file_name = i.source_file_name AND v.first_seen_source_row_number = i.source_row_number
+            """).fetchone()[0],
+        "issue_raw_record_id_mismatch": con.execute(f"""
+            SELECT count(*) FROM {issues} i ANTI JOIN raw.encounters e
+              ON e.batch_id = i.source_batch_id AND e.file_name = i.source_file_name
+             AND e.source_row_number = i.source_row_number AND e.source_record_id = i.source_record_id""").fetchone()[0],
+        "issue_text_values": {c: {r[0] for r in con.execute(f"SELECT DISTINCT {c} FROM {issues}").fetchall()}
+                              for c in ("source_system", "check_code", "field_name", "reason_code", "severity")},
+        "issue_key_shapes": con.execute(
+            f"SELECT count(*) FILTER (WHERE NOT regexp_full_match(version_key, '[0-9a-f]{{64}}') "
+            f"OR NOT regexp_full_match(encounter_key, '[0-9a-f]{{64}}')) FROM {issues}").fetchone()[0],
+        "report": con.execute(f"SELECT {report_columns} FROM {dq_report.TABLE} ORDER BY {dq_report.ORDER_BY}").fetchall(),
+        "quarantine": con.execute(
+            f"SELECT {', '.join(quarantine.COLUMNS)} FROM {quarantine.TABLE} ORDER BY {quarantine.ORDER_BY}").fetchall(),
+        "gate_rejected_issues": con.execute(f"SELECT count(*) FROM {publish_gate.TABLE}").fetchone()[0],
+        # ROW and VERSION entries of accepted batches whose lineage is not the raw row with that source_record_id.
+        "quarantine_lineage_unresolved": con.execute(f"""
+            SELECT count(*) FROM {quarantine.TABLE} q ANTI JOIN raw.encounters e
+              ON e.batch_id = q.batch_id AND e.file_name = q.file_name AND e.source_row_number = q.source_row_number
+             AND e.source_record_id IS NOT DISTINCT FROM q.source_record_id
+            WHERE q.quarantine_level <> 'FILE' AND q.batch_status = 'ACCEPTED'""").fetchone()[0],
+    }
+
+
 def capture(env) -> dict:
     db = Path(env["RAW_DB_PATH"])
     con = attach(db)
     try:
         state = {
+            "dq": dq_state(con),
             "audit": con.execute(f"SELECT {', '.join(AUDIT_COLUMNS)} FROM ops.batch_audit ORDER BY batch_id, file_name").fetchall(),
             "counts": {t: con.execute(f"SELECT count(*) FROM {t}").fetchone()[0] for t in STATE_TABLES},
             "current_totals": monthly_totals(con),
@@ -388,6 +461,15 @@ def test_rejected_batch_004_changes_no_derived_state(runs):
     for table in DERIVED_TABLES:
         assert after_004["digest_all"][table] == after_003["digest_all"][table], table
     assert after_004["current_totals"] == after_003["current_totals"]
+    # The DQ report gains batch_004's rows; every row of the accepted batches is unchanged.
+    report_003, report_004 = after_003["dq"]["report"], after_004["dq"]["report"]
+    assert [r for r in report_004 if r[0] != "batch_004"] == report_003
+    assert {r[1] for r in report_004 if r[0] == "batch_004"} == {"REJECTED"}
+    # Quarantine likewise gains only batch_004's three rejected files.
+    quarantine_003, quarantine_004 = after_003["dq"]["quarantine"], after_004["dq"]["quarantine"]
+    assert [r for r in quarantine_004 if r[0] != "batch_004"] == quarantine_003
+    assert [(r[1], r[4], r[5]) for r in quarantine_004 if r[0] == "batch_004"] == [
+        (f, "FILE", "BATCH_VALIDATION") for f in (ATHENA, EPIC, MEDITECH)]
     new_rows = [row for row in after_004["audit"] if row not in after_003["audit"]]
     assert after_004["audit"][: len(after_003["audit"])] == after_003["audit"]  # earlier rows untouched, timings too
     assert len(new_rows) == 3
@@ -580,3 +662,228 @@ def test_exported_csvs_are_byte_identical(runs, run):
 
 def test_rejected_batch_004_changes_no_exported_csv(runs):
     assert runs["batch_004"]["exports"] == runs["batch_003"]["exports"]
+
+
+# --- Task 6 group (a): version DQ issues and the DQ report ---
+
+# Version issues per (first-seen batch, check), as profiled in the Task 6 design review.
+APPROVED_DQ_ISSUES = {
+    ("batch_001", "FACILITY_RESOLVED"): 27, ("batch_001", "ADMIT_DATE_VALID"): 17,
+    ("batch_001", "DISCHARGE_DATE_VALID"): 794, ("batch_001", "DISCHARGE_NOT_BEFORE_ADMIT"): 7,
+    ("batch_001", "ENCOUNTER_TYPE_MAPPED"): 17, ("batch_001", "PAYER_MAPPED"): 8,
+    ("batch_001", "PRIMARY_DX_VALID"): 11, ("batch_001", "PRIMARY_DX_IN_REFERENCE"): 17,
+    ("batch_001", "ATTENDING_NPI_VALID"): 18, ("batch_001", "ATTENDING_NPI_IN_ROSTER"): 16,
+    ("batch_001", "BILLED_AMOUNT_VALID"): 50, ("batch_001", "PATIENT_LINKED"): 28, ("batch_001", "AGE_BAND_KNOWN"): 29,
+    ("batch_002", "FACILITY_RESOLVED"): 4, ("batch_002", "ADMIT_DATE_VALID"): 1,
+    ("batch_002", "DISCHARGE_DATE_VALID"): 96, ("batch_002", "ENCOUNTER_TYPE_MAPPED"): 1, ("batch_002", "PAYER_MAPPED"): 4,
+    ("batch_002", "PRIMARY_DX_VALID"): 15, ("batch_002", "PRIMARY_DX_IN_REFERENCE"): 1,
+    ("batch_002", "ATTENDING_NPI_VALID"): 1, ("batch_002", "ATTENDING_NPI_IN_ROSTER"): 2,
+    ("batch_002", "BILLED_AMOUNT_VALID"): 5, ("batch_002", "PATIENT_LINKED"): 3, ("batch_002", "AGE_BAND_KNOWN"): 3,
+    ("batch_003", "FACILITY_RESOLVED"): 1, ("batch_003", "DISCHARGE_DATE_VALID"): 37,
+    ("batch_003", "ATTENDING_NPI_VALID"): 1, ("batch_003", "PATIENT_LINKED"): 2, ("batch_003", "AGE_BAND_KNOWN"): 3,
+}  # fmt: skip
+APPROVED_ERROR_REASONS = {
+    ("batch_001", "FACILITY_RESOLVED", "FACILITY_UNRESOLVED"): 27,
+    ("batch_002", "FACILITY_RESOLVED", "FACILITY_UNRESOLVED"): 4,
+    ("batch_003", "FACILITY_RESOLVED", "FACILITY_UNRESOLVED"): 1,
+    ("batch_001", "ADMIT_DATE_VALID", "DATE_INVALID"): 12,
+    ("batch_001", "ADMIT_DATE_VALID", "DATE_AFTER_DELIVERY"): 3,
+    ("batch_001", "ADMIT_DATE_VALID", "DATE_PLACEHOLDER"): 2,
+    ("batch_002", "ADMIT_DATE_VALID", "DATE_AFTER_DELIVERY"): 1,
+}
+# Each version once, by its worst severity.
+APPROVED_DQ_PARTITION = {
+    ("batch_001", "ERROR"): 44, ("batch_001", "WARNING"): 907, ("batch_001", "PASS"): 1882,
+    ("batch_002", "ERROR"): 5, ("batch_002", "WARNING"): 122, ("batch_002", "PASS"): 418,
+    ("batch_003", "ERROR"): 1, ("batch_003", "WARNING"): 40, ("batch_003", "PASS"): 122,
+}  # fmt: skip
+REPORT_INDEX = {c: i for i, c in enumerate(dq_report.COLUMNS)}
+STRUCTURAL_PASSING = ("FILE_SHA256_MATCH", "FILE_ENCODING_VALID", "FILE_CSV_PARSEABLE", "RECORD_SHAPE_VALID",
+                      "SCHEMA_CONTRACT_MATCH")  # fmt: skip
+
+
+def report_rows(run_state, **where):
+    return [
+        dict(zip(dq_report.COLUMNS, row, strict=True))
+        for row in run_state["dq"]["report"]
+        if all(row[REPORT_INDEX[k]] == v for k, v in where.items())
+    ]
+
+
+def test_approved_version_dq_issues(runs):
+    dq = runs["batch_004"]["dq"]
+
+    assert dq["issues_by_check"] == APPROVED_DQ_ISSUES
+    assert dq["error_reasons"] == APPROVED_ERROR_REASONS
+    assert dq["partition"] == APPROVED_DQ_PARTITION
+    assert dq["current_error_versions"] == 49  # 31 facility + 18 admit date: still current, flagged
+
+
+def test_every_classified_reason_in_the_stored_tables_is_one_version_issue(runs):
+    for run in FINAL_RUNS:
+        dq = runs[run]["dq"]
+        assert dq["issue_totals"] == dq["recount"], run
+
+
+@pytest.mark.parametrize("run", FINAL_RUNS)
+def test_version_issues_have_valid_lineage_and_no_free_text(runs, run):
+    dq = runs[run]["dq"]
+
+    assert dq["issue_lineage_unresolved"] == 0
+    assert dq["issue_raw_record_id_mismatch"] == 0  # source_record_id is the row's own, nothing else
+    assert dq["issue_key_shapes"] == 0
+    values = dq["issue_text_values"]
+    assert values["source_system"] <= set(CONVENTIONS)
+    assert values["check_code"] <= set(dq_rules.VERSION_CHECKS)
+    assert values["field_name"] <= {dq_rules.CHECKS_BY_CODE[c].field_name for c in dq_rules.VERSION_CHECKS}
+    assert values["reason_code"] <= {code for _, code in dq_rules.CODE_MAP}
+    assert values["severity"] <= {"ERROR", "WARNING"}
+
+
+def test_dq_report_totals_and_statuses(runs):
+    state = runs["batch_004"]
+    statuses = Counter((r["batch_id"], r["status"]) for r in report_rows(state))
+
+    # 12 files; per batch MANIFEST_VALID and PUBLISH_GATE; REJECTED_BATCH_NOT_LOADED for batch_004.
+    assert len(state["dq"]["report"]) == 12 * len(dq_report.FILE_CHECKS) + 4 + 4 + 1
+    assert statuses == {
+        ("batch_001", "FAIL"): 5, ("batch_001", "WARN"): 30, ("batch_001", "PASS"): 120,
+        ("batch_002", "FAIL"): 2, ("batch_002", "WARN"): 16, ("batch_002", "PASS"): 137,
+        ("batch_003", "FAIL"): 1, ("batch_003", "WARN"): 10, ("batch_003", "PASS"): 144,
+        ("batch_004", "FAIL"): 3, ("batch_004", "PASS"): 17, ("batch_004", "NOT_EVALUATED"): 136,
+    }  # fmt: skip
+    # The FAILs of accepted batches are the version ERRORs (facility, admit date), per file.
+    failed = sorted((r["batch_id"], r["file_name"], r["check_code"], r["observed_count"])
+                    for r in report_rows(state, status="FAIL", batch_status="ACCEPTED"))
+    assert failed == [
+        ("batch_001", ATHENA, "ADMIT_DATE_VALID", 7), ("batch_001", ATHENA, "FACILITY_RESOLVED", 20),
+        ("batch_001", EPIC, "ADMIT_DATE_VALID", 7), ("batch_001", EPIC, "FACILITY_RESOLVED", 7),
+        ("batch_001", MEDITECH, "ADMIT_DATE_VALID", 3),
+        ("batch_002", ATHENA, "FACILITY_RESOLVED", 4), ("batch_002", EPIC, "ADMIT_DATE_VALID", 1),
+        ("batch_003", ATHENA, "FACILITY_RESOLVED", 1),
+    ]  # fmt: skip
+
+
+def test_dq_report_row_and_version_counts_per_batch(runs):
+    state = runs["batch_004"]
+
+    def per_batch(check, column):
+        totals = Counter()
+        for r in report_rows(state, check_code=check, batch_status="ACCEPTED"):
+            totals[r["batch_id"]] += r[column]
+        return dict(totals)
+
+    assert per_batch("RECON_RAW_ROWS", "evaluated_count") == {"batch_001": 2863, "batch_002": 585, "batch_003": 188}
+    assert per_batch("RECON_HISTORY_ROWS", "observed_count") == {"batch_001": 2833, "batch_002": 545, "batch_003": 163}
+    assert per_batch("DUPLICATE_ROW", "observed_count") == {"batch_001": 30, "batch_002": 40, "batch_003": 0}
+    assert per_batch("STALE_ROW", "observed_count") == {"batch_001": 0, "batch_002": 0, "batch_003": 25}
+    assert per_batch("RECON_CURRENT_ROWS", "observed_count") == {"batch_001": 2650, "batch_002": 461, "batch_003": 163}
+    changed = report_rows(state, check_code="SCHEMA_VERSION_CHANGED", status="WARN")
+    assert [(r["batch_id"], r["file_name"], r["observed_count"], r["reason_codes"]) for r in changed] == [
+        ("batch_003", ATHENA, 1, "SCHEMA_VERSION_CHANGED")]  # Athena v1 -> v2; the version name is not a code
+    assert {r["reason_codes"] for r in report_rows(state, check_code="SCHEMA_VERSION_CHANGED", status="PASS")} == {None}
+
+
+@pytest.mark.parametrize("run", FINAL_RUNS)
+def test_every_pipeline_invariant_passes(runs, run):
+    invariants = {c.code for c in dq_rules.CHECKS if c.invariant}
+    rows = [r for r in report_rows(runs[run]) if r["check_code"] in invariants]
+    accepted = [r for r in rows if r["batch_status"] == "ACCEPTED"]
+
+    assert len(accepted) == 9 * (len(invariants) - 1)  # every file invariant for the 9 accepted files
+    assert {r["status"] for r in accepted} == {"PASS"}
+    assert all(r["observed_count"] == r["expected_count"] for r in accepted)
+
+
+def test_rejected_batch_004_in_the_dq_report(runs):
+    rows = report_rows(runs["batch_004"], batch_id="batch_004")
+    evaluated = sorted((r["file_name"] or "", r["check_code"], r["status"], r["observed_count"], r["expected_count"],
+                        r["reason_codes"]) for r in rows if r["status"] != "NOT_EVALUATED")
+
+    assert evaluated == sorted([
+        ("", "MANIFEST_VALID", "PASS", 0, None, None),
+        ("", "REJECTED_BATCH_NOT_LOADED", "PASS", 0, 0, None),
+        *((f, c, "PASS", 0, None, None) for f in (ATHENA, MEDITECH) for c in STRUCTURAL_PASSING),
+        (ATHENA, "ROW_COUNT_MATCH", "PASS", 22, 22, None),
+        (MEDITECH, "ROW_COUNT_MATCH", "PASS", 22, 22, None),
+        (EPIC, "FILE_SHA256_MATCH", "FAIL", 1, None, "SHA256_MISMATCH"),
+        (EPIC, "FILE_ENCODING_VALID", "PASS", 0, None, None),
+        (EPIC, "FILE_CSV_PARSEABLE", "PASS", 0, None, None),
+        (EPIC, "RECORD_SHAPE_VALID", "FAIL", 1, None, "MALFORMED_RECORD"),
+        (EPIC, "SCHEMA_CONTRACT_MATCH", "PASS", 0, None, None),
+        (EPIC, "ROW_COUNT_MATCH", "FAIL", 18, 22, "ROW_COUNT_MISMATCH"),
+    ])  # fmt: skip
+    not_evaluated = [r for r in rows if r["status"] == "NOT_EVALUATED"]
+    # Every non-structural file check, and the gate: Task 1 rejected batch_004 before it.
+    assert len(not_evaluated) == 3 * (len(dq_report.FILE_CHECKS) - len(dq_rules.STRUCTURAL_FILE_CHECKS)) + 1
+    assert [r["check_code"] for r in not_evaluated if r["file_name"] is None] == ["PUBLISH_GATE"]
+    assert {r["reason_codes"] for r in not_evaluated} == {"BATCH_REJECTED"}
+
+
+def test_dq_report_cells_are_controlled_vocabulary(runs):
+    """Every text cell is a batch id, a file name, a source system, a catalog value or a code: no free text."""
+    state = runs["batch_004"]
+    audit = [dict(zip(AUDIT_COLUMNS, row, strict=True)) for row in state["audit"]]
+    codes = {code for _, code in dq_rules.CODE_MAP} | {dq_report.BATCH_REJECTED}  # classified codes only
+    allowed = {
+        "batch_id": {a["batch_id"] for a in audit},
+        "file_name": {a["file_name"] for a in audit} | {None},
+        "source_system": set(CONVENTIONS) | {None},
+        "check_code": {c.code for c in dq_rules.CHECKS},
+    }
+    for row in report_rows(state):
+        for column, values in allowed.items():
+            assert row[column] in values, column
+        assert set((row["reason_codes"] or "").split("|")) - {""} <= codes, row["check_code"]
+
+
+# --- Task 6 group (b): the publish gate and the quarantine ---
+
+
+def test_batches_001_to_003_pass_the_publish_gate(runs):
+    gate = [(r["batch_id"], r["batch_status"], r["evaluated_count"], r["observed_count"], r["observed_pct"],
+             r["threshold_pct"], r["status"], r["reason_codes"])
+            for r in report_rows(runs["batch_004"], check_code="PUBLISH_GATE")]  # fmt: skip
+
+    assert gate == [
+        ("batch_001", "ACCEPTED", 2863, 44, Decimal("1.54"), Decimal("5.00"), "PASS", None),
+        ("batch_002", "ACCEPTED", 585, 5, Decimal("0.85"), Decimal("5.00"), "PASS", None),
+        ("batch_003", "ACCEPTED", 188, 1, Decimal("0.53"), Decimal("5.00"), "PASS", None),
+        ("batch_004", "REJECTED", None, None, None, Decimal("5.00"), "NOT_EVALUATED", "BATCH_REJECTED"),
+    ]
+    assert runs["batch_004"]["dq"]["gate_rejected_issues"] == 0
+
+
+def test_approved_quarantine(runs):
+    rows = [dict(zip(quarantine.COLUMNS, r, strict=True)) for r in runs["batch_004"]["dq"]["quarantine"]]
+    versions = [r for r in rows if r["quarantine_level"] == "VERSION"]
+
+    assert len(rows) == 53
+    assert Counter((r["batch_id"], r["quarantine_level"], r["quarantine_source"]) for r in rows) == {
+        ("batch_001", "VERSION", "VERSION_DQ"): 44,
+        ("batch_002", "VERSION", "VERSION_DQ"): 5,
+        ("batch_003", "VERSION", "VERSION_DQ"): 1,
+        ("batch_004", "FILE", "BATCH_VALIDATION"): 3,
+    }
+    assert Counter(r["reason_codes"] for r in versions) == {
+        "FACILITY_UNRESOLVED": 32, "DATE_INVALID": 12, "DATE_AFTER_DELIVERY": 4, "DATE_PLACEHOLDER": 2}
+    # 49 still current (flagged, kept out of analytics); 1 superseded by a newer version that also fails.
+    assert Counter(r["is_current_version"] for r in versions) == {True: 49, False: 1}
+    assert [(r["file_name"], r["reason_codes"], r["row_count"]) for r in rows if r["quarantine_level"] == "FILE"] == [
+        (ATHENA, "SIBLING_FILE_REJECTED", 22),
+        (EPIC, "MALFORMED_RECORD|ROW_COUNT_MISMATCH|SHA256_MISMATCH", 18),
+        (MEDITECH, "SIBLING_FILE_REJECTED", 22),
+    ]
+    audit = {(a[0], a[1]): a[AUDIT_COLUMNS.index("reason")] for a in runs["batch_004"]["audit"]}
+    assert all(r["reason_detail"] == audit[(r["batch_id"], r["file_name"])] for r in rows if r["quarantine_level"] == "FILE")
+    assert all(r["reason_detail"] is None and r["row_count"] == 1 for r in versions)
+
+
+@pytest.mark.parametrize("run", FINAL_RUNS)
+def test_quarantine_lineage_and_reconciliation(runs, run):
+    dq = runs[run]["dq"]
+
+    assert dq["quarantine_lineage_unresolved"] == 0
+    rows = report_rows(runs[run], check_code="RECON_QUARANTINE_ROWS", batch_status="ACCEPTED")
+    assert len(rows) == 9 and {r["status"] for r in rows} == {"PASS"}
+    assert sum(r["observed_count"] for r in rows) == 50  # 0 Task 4 rows + 50 ERROR versions

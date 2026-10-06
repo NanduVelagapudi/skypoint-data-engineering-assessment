@@ -24,7 +24,7 @@ from pathlib import Path
 import duckdb
 
 from pipeline import batch_audit
-from pipeline.errors import ConfigError, PipelineError
+from pipeline.errors import ConfigError, PipelineError, PublishGateFailed
 from pipeline.schema_contract import COLUMN_NAME
 
 log = logging.getLogger(__name__)
@@ -132,7 +132,9 @@ def _transaction(con: duckdb.DuckDBPyConnection, batch_id: str) -> Iterator[None
     except BaseException as exc:
         with contextlib.suppress(duckdb.Error):  # a failed commit may already have rolled back
             con.rollback()
-        log.error(
+        # A failed publish gate is a data outcome, not a failure: the batch is then recorded as rejected.
+        log.log(
+            logging.WARNING if isinstance(exc, PublishGateFailed) else logging.ERROR,
             "batch_write_rolled_back",
             extra={"step": "store", "batch_id": batch_id, "error_type": type(exc).__name__},
         )
@@ -184,13 +186,22 @@ def write_accepted_batch(
 
 
 def write_rejected_batch(
-    con: duckdb.DuckDBPyConnection, batch_id: str, audit_rows: Sequence[batch_audit.AuditRow]
+    con: duckdb.DuckDBPyConnection,
+    batch_id: str,
+    audit_rows: Sequence[batch_audit.AuditRow],
+    with_audit: Callable[[duckdb.DuckDBPyConnection], None] | None = None,
 ) -> None:
-    """A rejected batch writes its audit rows and nothing else."""
+    """A rejected batch writes its audit rows and nothing else in raw.
+
+    `with_audit`, if given, runs in the same transaction: the batch processor
+    uses it to store the failing rows of a batch the publish gate rejected.
+    """
     if any(r.batch_id != batch_id for r in audit_rows):
         raise ValueError("all audit rows must belong to the batch being written")
     with _transaction(con, batch_id):
         batch_audit.insert_audit_rows(con, audit_rows)
+        if with_audit is not None:
+            with_audit(con)
 
 
 def _insert_rows(con: duckdb.DuckDBPyConnection, accepted: AcceptedFile, ingested_at: datetime) -> None:

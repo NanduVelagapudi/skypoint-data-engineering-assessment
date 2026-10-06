@@ -2,8 +2,9 @@
 
 Two kinds of failure, handled differently:
 
-* Data/input validation failures (ValidationFailure, BatchRejected) reject a
-  batch. They are expected, recorded in batch_audit, and the run exits 0.
+* Data/input validation failures (ValidationFailure, BatchRejected) and a
+  failed publish gate (PublishGateFailed) reject a batch. They are expected,
+  recorded in batch_audit, and the run exits 0.
 * Pipeline/system failures (PipelineError and its subclasses, or any
   unexpected exception) stop the run with a non-zero exit code.
 
@@ -34,6 +35,8 @@ class ReasonCode(StrEnum):
     MALFORMED_RECORD = "MALFORMED_RECORD"
     ROW_COUNT_MISMATCH = "ROW_COUNT_MISMATCH"
     SIBLING_FILE_REJECTED = "SIBLING_FILE_REJECTED"
+    # Task 6: more than the threshold share of the batch's rows failed error-level DQ checks.
+    DQ_GATE_FAILED = "DQ_GATE_FAILED"
 
 
 @dataclass(frozen=True)
@@ -58,6 +61,19 @@ class BatchRejected(Exception):
     def __init__(self, failures: list[ValidationFailure]):
         self.failures = failures
         super().__init__(format_reasons(failures))
+
+
+class PublishGateFailed(Exception):
+    """Raised inside a batch's transaction when the batch fails the Task 6 publish gate.
+
+    A data outcome, like BatchRejected: the transaction rolls back and the
+    batch is recorded as REJECTED (DQ_GATE_FAILED). `result` is the gate's
+    PHI-free result (counts, and lineage and codes of the failing rows).
+    """
+
+    def __init__(self, result: object):
+        self.result = result
+        super().__init__(str(ReasonCode.DQ_GATE_FAILED))
 
 
 class PipelineError(Exception):
