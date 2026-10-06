@@ -453,6 +453,12 @@ def ensure_tables(con: duckdb.DuckDBPyConnection) -> None:
     con.execute(_CREATE_CURRENT_VIEW)
 
 
+def clear_history(con: duckdb.DuckDBPyConnection) -> None:
+    """Empty the derived history tables, inside the caller's transaction (rebuild only)."""
+    con.execute(f"DELETE FROM {OUTCOMES_TABLE}")
+    con.execute(f"DELETE FROM {VERSIONS_TABLE}")
+
+
 def read_batch_rows(
     con: duckdb.DuckDBPyConnection, batch_id: str, conventions: Mapping[str, SourceConventions]
 ) -> list[BatchRow]:

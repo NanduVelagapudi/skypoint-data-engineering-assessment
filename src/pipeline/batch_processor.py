@@ -20,10 +20,14 @@ already ingested in an earlier batch is still accepted (its rows classify as
 duplicates or stale) with DUPLICATE_FILE in its audit reason, and an already
 processed batch folder whose files have changed is skipped as before, with a
 warning in the log. Logs carry allow-listed keys only and never row values.
+
+rebuild_derived replays the same per-batch history step over raw, in batch_id
+order; it is also how a database from before Task 4 is migrated.
 """
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import re
 from collections.abc import Mapping, Sequence
@@ -33,7 +37,7 @@ from pathlib import Path
 
 import duckdb
 
-from pipeline import encounter_history, raw_store
+from pipeline import batch_audit, encounter_history, raw_store
 from pipeline.batch_audit import RECONCILED, AuditRow, BatchStatus, processed_batch_ids
 from pipeline.csv_reader import parse_csv
 from pipeline.errors import BatchRejected, PipelineError, ReasonCode, ValidationFailure, format_reasons
@@ -186,9 +190,7 @@ def process_batch(
 
     def add_history(con: duckdb.DuckDBPyConnection) -> list[AuditRow]:
         """Runs inside the batch transaction, after the raw rows are written."""
-        encounter_history.apply_batch(con, batch_id, conventions)
-        counts = encounter_history.file_counts(con, batch_id)
-        final_rows[:] = [_reconciled(row, counts) for row in rows]
+        final_rows[:] = _classify_into_history(con, batch_id, rows, conventions)
         return final_rows
 
     raw_store.write_accepted_batch(con, batch_id, files, rows, ingested_at=end, before_audit=add_history)
@@ -196,6 +198,58 @@ def process_batch(
     received_rows = sum(len(f.rows) for f in files)
     _log_outcome(batch_id, BatchStatus.ACCEPTED, accepted_rows, start, end, rows=final_rows)
     return BatchResult(batch_id, BatchStatus.ACCEPTED, accepted_rows, received_rows)
+
+
+def _classify_into_history(
+    con: duckdb.DuckDBPyConnection,
+    batch_id: str,
+    rows: Sequence[AuditRow],
+    conventions: Mapping[str, SourceConventions],
+) -> list[AuditRow]:
+    """Classify an accepted batch already in raw into the history; return its reconciled audit rows.
+
+    The one Task 4 step for a batch, inside the caller's transaction: used by
+    the incremental load and, batch by batch, by rebuild_derived.
+    """
+    encounter_history.apply_batch(con, batch_id, conventions)
+    counts = encounter_history.file_counts(con, batch_id)
+    return [_reconciled(row, counts) for row in rows]
+
+
+def rebuild_derived(con: duckdb.DuckDBPyConnection, conventions: Mapping[str, SourceConventions]) -> list[str]:
+    """Rebuild the Task 4 history and audit counts from raw; returns the batch ids replayed.
+
+    In one transaction: migrate a pre-Task-4 ops.batch_audit if needed, empty
+    the history tables, then replay every accepted batch in batch_id order
+    through _classify_into_history, the same step an incremental load runs,
+    and overwrite the batch's accepted_count and Task 4 audit columns. Raw
+    rows, file records and every other audit value (status, reason, timings)
+    are left as they are. If anything fails, everything rolls back, so a
+    pre-Task-4 database stays pre-Task-4 and is still refused by normal runs.
+    """
+    log.info("derived_rebuild_started", extra={"step": "rebuild"})
+    con.begin()
+    try:
+        if not batch_audit.has_task4_columns(con):
+            batch_audit.migrate_audit_table(con)
+            log.warning("batch_audit_migrated", extra={"step": "rebuild"})
+        encounter_history.ensure_tables(con)
+        encounter_history.clear_history(con)
+        batch_ids = [r[0] for r in con.execute("SELECT DISTINCT batch_id FROM raw.ingested_files ORDER BY batch_id").fetchall()]
+        for batch_id in batch_ids:
+            rows = batch_audit.read_audit_rows(con, batch_id)
+            ingested = {r[0] for r in con.execute("SELECT file_name FROM raw.ingested_files WHERE batch_id = ?", [batch_id]).fetchall()}
+            if {r.file_name for r in rows} != ingested or any(r.status != BatchStatus.ACCEPTED for r in rows):
+                raise PipelineError(f"audit rows of {batch_id} do not match its ingested files")
+            batch_audit.update_task4_counts(con, _classify_into_history(con, batch_id, rows, conventions))
+        con.commit()
+    except BaseException as exc:
+        with contextlib.suppress(duckdb.Error):  # a failed commit may already have rolled back
+            con.rollback()
+        log.error("derived_rebuild_rolled_back", extra={"step": "rebuild", "error_type": type(exc).__name__})
+        raise
+    log.info("derived_rebuild_finished", extra={"step": "rebuild", "status": "COMPLETED"})
+    return batch_ids
 
 
 def _duplicate_files(con: duckdb.DuckDBPyConnection, files: Sequence[AcceptedFile]) -> dict[str, str]:

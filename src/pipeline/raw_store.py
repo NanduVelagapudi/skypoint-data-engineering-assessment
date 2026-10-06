@@ -86,22 +86,30 @@ def _ident(name: str) -> str:
     return f'"{name}"'
 
 
-def open_store(db_path: Path, canonical_columns: Sequence[str]) -> duckdb.DuckDBPyConnection:
-    """Connect to the raw database, creating it and its tables if needed."""
+def open_store(
+    db_path: Path, canonical_columns: Sequence[str], *, allow_outdated_audit: bool = False
+) -> duckdb.DuckDBPyConnection:
+    """Connect to the raw database, creating it and its tables if needed.
+
+    A database whose ops.batch_audit predates Task 4 is refused unless
+    `allow_outdated_audit` is set, which only the derived-state rebuild does.
+    """
     db_path.parent.mkdir(parents=True, exist_ok=True)
     con = duckdb.connect()  # in-memory session; the database file is attached below
     try:
         quoted_path = str(db_path).replace("'", "''")
         con.execute(f"ATTACH '{quoted_path}' AS {CATALOG}")
         con.execute(f"USE {CATALOG}")
-        ensure_tables(con, canonical_columns)
+        ensure_tables(con, canonical_columns, allow_outdated_audit=allow_outdated_audit)
     except BaseException:
         con.close()
         raise
     return con
 
 
-def ensure_tables(con: duckdb.DuckDBPyConnection, canonical_columns: Sequence[str]) -> None:
+def ensure_tables(
+    con: duckdb.DuckDBPyConnection, canonical_columns: Sequence[str], *, allow_outdated_audit: bool = False
+) -> None:
     overlap = set(canonical_columns) & set(LINEAGE_COLUMNS)
     if overlap:
         raise ConfigError("canonical columns must not reuse lineage column names")
@@ -112,7 +120,7 @@ def ensure_tables(con: duckdb.DuckDBPyConnection, canonical_columns: Sequence[st
     for column in canonical_columns:
         con.execute(f"ALTER TABLE raw.encounters ADD COLUMN IF NOT EXISTS {_ident(column)} VARCHAR")
     con.execute(_CREATE_INGESTED_FILES)
-    batch_audit.ensure_audit_table(con)
+    batch_audit.ensure_audit_table(con, allow_outdated=allow_outdated_audit)
 
 
 @contextlib.contextmanager

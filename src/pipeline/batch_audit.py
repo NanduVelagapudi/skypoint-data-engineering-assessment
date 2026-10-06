@@ -88,8 +88,11 @@ class AuditRow:
     reconciliation_status: str | None = None
 
 
+TASK4_COLUMNS = AUDIT_COLUMNS[AUDIT_COLUMNS.index("new_encounter_count") : AUDIT_COLUMNS.index("status")]
+
+# {{table}} is filled in by _create_sql: the migration builds the new layout under a temporary name.
 _CREATE_TABLE = f"""
-CREATE TABLE IF NOT EXISTS ops.batch_audit (
+CREATE TABLE IF NOT EXISTS {{table}} (
     batch_id                VARCHAR   NOT NULL,
     file_name               VARCHAR   NOT NULL,
     source_system           VARCHAR,
@@ -114,20 +117,55 @@ CREATE TABLE IF NOT EXISTS ops.batch_audit (
 """
 
 
-def ensure_audit_table(con: duckdb.DuckDBPyConnection) -> None:
-    con.execute("CREATE SCHEMA IF NOT EXISTS ops")
-    con.execute(_CREATE_TABLE)
-    present = {
+def _create_sql(table: str) -> str:
+    return _CREATE_TABLE.format(table=table)
+
+
+def _present_columns(con: duckdb.DuckDBPyConnection) -> list[str]:
+    return [
         row[0]
         for row in con.execute(
             "SELECT column_name FROM information_schema.columns "
-            "WHERE table_catalog = current_database() AND table_schema = 'ops' AND table_name = 'batch_audit'"
+            "WHERE table_catalog = current_database() AND table_schema = 'ops' AND table_name = 'batch_audit' "
+            "ORDER BY ordinal_position"
         ).fetchall()
-    }
-    if not present.issuperset(AUDIT_COLUMNS):
-        # A database from before Task 4 has no history for its batches; patching
-        # the columns in would hide that, so refuse it instead.
-        raise PipelineError("ops.batch_audit predates the Task 4 columns; rebuild the database from the landing data")
+    ]
+
+
+def has_task4_columns(con: duckdb.DuckDBPyConnection) -> bool:
+    return set(_present_columns(con)).issuperset(AUDIT_COLUMNS)
+
+
+def ensure_audit_table(con: duckdb.DuckDBPyConnection, *, allow_outdated: bool = False) -> None:
+    """Create ops.batch_audit if missing, and refuse one from before Task 4.
+
+    A database from before Task 4 has no history for its batches, so patching
+    the columns in would hide that. Only the rebuild may open it
+    (`allow_outdated`); it migrates the table and rebuilds the history in one
+    transaction.
+    """
+    con.execute("CREATE SCHEMA IF NOT EXISTS ops")
+    con.execute(_create_sql("ops.batch_audit"))
+    if not allow_outdated and not has_task4_columns(con):
+        raise PipelineError(
+            "ops.batch_audit predates the Task 4 columns; migrate it with python -m pipeline.main --rebuild-derived"
+        )
+
+
+def migrate_audit_table(con: duckdb.DuckDBPyConnection) -> None:
+    """Bring a pre-Task-4 ops.batch_audit to the current layout, inside the caller's transaction.
+
+    Every existing row and value is kept; the Task 4 columns start NULL and the
+    rebuild then fills them for accepted batches. The table is recreated rather
+    than altered so it gets the same column order and constraints as a new one.
+    """
+    kept = [c for c in AUDIT_COLUMNS if c in set(_present_columns(con))]
+    con.execute(_create_sql("ops.batch_audit_migrating"))
+    con.execute(
+        f"INSERT INTO ops.batch_audit_migrating ({', '.join(kept)}) SELECT {', '.join(kept)} FROM ops.batch_audit"
+    )
+    con.execute("DROP TABLE ops.batch_audit")
+    con.execute("ALTER TABLE ops.batch_audit_migrating RENAME TO batch_audit")
 
 
 def db_timestamp(value: datetime) -> datetime:
@@ -144,6 +182,28 @@ def db_timestamp(value: datetime) -> datetime:
 def processed_batch_ids(con: duckdb.DuckDBPyConnection) -> set[str]:
     """Batches with any audit row (ACCEPTED or REJECTED); every other batch is pending."""
     return {row[0] for row in con.execute("SELECT DISTINCT batch_id FROM ops.batch_audit").fetchall()}
+
+
+def read_audit_rows(con: duckdb.DuckDBPyConnection, batch_id: str) -> list[AuditRow]:
+    """One batch's audit rows, in file_name order."""
+    rows = []
+    for record in con.execute(
+        f"SELECT {', '.join(AUDIT_COLUMNS)} FROM ops.batch_audit WHERE batch_id = ? ORDER BY file_name", [batch_id]
+    ).fetchall():
+        values = dict(zip(AUDIT_COLUMNS, record, strict=True))
+        values["status"] = BatchStatus(values["status"])
+        values["start_time"] = values["start_time"].replace(tzinfo=UTC)  # stored as UTC
+        values["end_time"] = values["end_time"].replace(tzinfo=UTC)
+        rows.append(AuditRow(**values))
+    return rows
+
+
+def update_task4_counts(con: duckdb.DuckDBPyConnection, rows: Sequence[AuditRow]) -> None:
+    """Overwrite accepted_count and the Task 4 columns of existing rows, inside the caller's transaction."""
+    columns = ("accepted_count", *TASK4_COLUMNS)
+    sql = f"UPDATE ops.batch_audit SET {', '.join(f'{c} = ?' for c in columns)} WHERE batch_id = ? AND file_name = ?"
+    for row in rows:
+        con.execute(sql, [*(getattr(row, c) for c in columns), row.batch_id, row.file_name])
 
 
 def insert_audit_rows(con: duckdb.DuckDBPyConnection, rows: Sequence[AuditRow]) -> None:

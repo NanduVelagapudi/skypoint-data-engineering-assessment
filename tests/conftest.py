@@ -143,3 +143,109 @@ def restore_pipeline_logger():
     yield
     logger.handlers[:] = handlers
     logger.setLevel(level)
+
+
+# --- database state: pre-Task-4 layout and comparable digests ---
+
+# ops.batch_audit exactly as the last pre-Task-4 commit (94a9a89) created it.
+# raw.* and clean.encounter_patients are unchanged since then.
+STAGE1_AUDIT_DDL = """
+CREATE TABLE ops.batch_audit_stage1 (
+    batch_id          VARCHAR   NOT NULL,
+    file_name         VARCHAR   NOT NULL,
+    source_system     VARCHAR,
+    expected_count    INTEGER,
+    received_count    INTEGER,
+    accepted_count    INTEGER,
+    duplicate_count   INTEGER,
+    stale_count       INTEGER,
+    quarantined_count INTEGER,
+    status            VARCHAR   NOT NULL CHECK (status IN ('ACCEPTED', 'REJECTED')),
+    reason            VARCHAR,
+    start_time        TIMESTAMP NOT NULL,
+    end_time          TIMESTAMP NOT NULL,
+    PRIMARY KEY (batch_id, file_name)
+)
+"""
+
+# The operational timestamps that legitimately differ between runs. Nothing else is excluded.
+RUN_TIME_COLUMNS = {
+    "raw.encounters": ("ingested_at",),
+    "raw.ingested_files": ("ingested_at",),
+    "ops.batch_audit": ("start_time", "end_time"),
+}
+STATE_TABLES = (
+    "raw.encounters",
+    "raw.ingested_files",
+    "ops.batch_audit",
+    "clean.encounter_versions",
+    "clean.encounter_row_outcomes",
+    "clean.encounter_current",
+    "clean.encounter_patients",
+)
+
+
+def attach(db_path: Path):
+    """A plain DuckDB connection to a pipeline database file, attached the way raw_store does."""
+    import duckdb
+
+    con = duckdb.connect()
+    con.execute(f"ATTACH '{db_path}' AS raw_store")
+    con.execute("USE raw_store")
+    return con
+
+
+def make_pre_task4(db_path: Path) -> None:
+    """Turn a pipeline database into what a pre-Task-4 build left behind.
+
+    The history tables and view are dropped, and ops.batch_audit goes back to the
+    Stage 1 layout with Stage 1 values: accepted_count = rows landed for an
+    accepted file, and duplicate, stale and quarantined counts NULL. Raw rows,
+    file records, encounter_patients and audit timings are kept as they are.
+    """
+    con = attach(db_path)
+    try:
+        con.execute("DROP VIEW IF EXISTS clean.encounter_current")
+        con.execute("DROP TABLE IF EXISTS clean.encounter_versions")
+        con.execute("DROP TABLE IF EXISTS clean.encounter_row_outcomes")
+        con.execute(STAGE1_AUDIT_DDL)
+        con.execute(
+            "INSERT INTO ops.batch_audit_stage1 "
+            "SELECT batch_id, file_name, source_system, expected_count, received_count, "
+            "       CASE WHEN status = 'ACCEPTED' THEN received_count ELSE 0 END, NULL, NULL, NULL, "
+            "       status, reason, start_time, end_time "
+            "FROM ops.batch_audit"
+        )
+        con.execute("DROP TABLE ops.batch_audit")
+        con.execute("ALTER TABLE ops.batch_audit_stage1 RENAME TO batch_audit")
+    finally:
+        con.close()
+
+
+def table_columns(con, table: str) -> list[str]:
+    return [row[0] for row in con.execute(f"DESCRIBE {table}").fetchall()]
+
+
+def state_digest(db_path: Path, *, exclude_run_times: bool = True) -> dict[str, tuple]:
+    """Per table: (compared columns, excluded columns, row count, SHA-256 of the sorted rows).
+
+    Rows are hashed, not returned, so a failing comparison never prints a raw
+    value (raw.encounters holds PHI). Only RUN_TIME_COLUMNS can be excluded.
+    """
+    con = attach(db_path)
+    try:
+        digest = {}
+        for table in STATE_TABLES:
+            columns = table_columns(con, table)
+            excluded = RUN_TIME_COLUMNS.get(table, ()) if exclude_run_times else ()
+            kept = [c for c in columns if c not in excluded]
+            rows = con.execute(f"SELECT {', '.join(kept)} FROM {table} ORDER BY ALL").fetchall()
+            digest[table] = (
+                tuple(kept),
+                tuple(c for c in columns if c in excluded),
+                len(rows),
+                hashlib.sha256(repr(rows).encode("utf-8")).hexdigest(),
+            )
+        return digest
+    finally:
+        con.close()

@@ -1,0 +1,339 @@
+"""Task 4 group (c): incremental, one-shot, rerun and rebuild runs on the real data pack agree.
+
+The data pack is only read: batch folders are copied into tmp_path for the
+incremental runs. Every database and output folder lives in tmp_path, and the
+repository's data/, output/ and work/ are checked to be unchanged afterwards.
+
+Runs compared:
+    incremental   landing holds 001, then 001-002, 001-003, 001-004 (one run each)
+    rerun         the incremental database run again
+    one_shot      a fresh database, landing 001-004 in one run
+    rebuild       a copy of the one-shot database taken back to the pre-Task-4
+                  layout, then python -m pipeline.main --rebuild-derived
+    rebuild_live  a copy of the incremental database rebuilt in place
+
+Tables are compared by digest (conftest.state_digest): the compared columns,
+the excluded columns, the row count and a hash of the sorted rows, so a failure
+names the table without printing PHI. Only ingested_at, start_time and end_time
+are excluded, and a test checks that.
+"""
+
+import csv
+import hashlib
+import logging
+import shutil
+from collections import defaultdict
+from datetime import datetime
+from decimal import Decimal
+from pathlib import Path
+
+import pytest
+from conftest import (
+    CONTRACT_PATH,
+    REAL_DATA_DIR,
+    REPO_ROOT,
+    RUN_TIME_COLUMNS,
+    STATE_TABLES,
+    TEST_PATIENT_KEY_SECRET,
+    attach,
+    make_pre_task4,
+    state_digest,
+)
+
+from pipeline.batch_audit import AUDIT_COLUMNS, TASK4_COLUMNS
+from pipeline.main import main
+from pipeline.parsers.amount import parse_amount
+from pipeline.parsers.categorical import ClaimStatus, parse_claim_status
+from pipeline.parsers.dates import parse_date
+from pipeline.source_conventions import load_source_conventions
+
+LANDING = REAL_DATA_DIR / "landing"
+REFERENCE = REAL_DATA_DIR / "reference"
+CONVENTIONS = load_source_conventions(REFERENCE / "source_systems_and_facilities.json")
+BATCH_IDS = ("batch_001", "batch_002", "batch_003", "batch_004")
+FINAL_RUNS = ("batch_004", "rerun", "one_shot", "rebuild", "rebuild_live")
+DERIVED_TABLES = tuple(t for t in STATE_TABLES if t != "ops.batch_audit")
+CSV_RUN_TIME_COLUMNS = ("start_time", "end_time")
+ATHENA, EPIC, MEDITECH = "encounters_athena_clinics.csv", "encounters_epic_north.csv", "encounters_legacy_meditech.csv"
+
+# (received, accepted, new_encounter, new_version, duplicate, stale, stale_new_version,
+#  quarantined, history_rows_written, current_changed) - the approved Task 4 table.
+APPROVED_PER_FILE = {
+    ("batch_001", ATHENA): (1090, 1082, 1082, 0, 8, 0, 0, 0, 1082, 1082),
+    ("batch_001", EPIC): (1432, 1415, 1415, 0, 17, 0, 0, 0, 1415, 1415),
+    ("batch_001", MEDITECH): (341, 336, 336, 0, 5, 0, 0, 0, 336, 336),
+    ("batch_002", ATHENA): (147, 133, 61, 72, 14, 0, 0, 0, 133, 133),
+    ("batch_002", EPIC): (174, 154, 69, 85, 20, 0, 0, 0, 154, 154),
+    ("batch_002", MEDITECH): (264, 258, 232, 26, 6, 0, 0, 0, 258, 258),
+    ("batch_003", ATHENA): (74, 65, 25, 40, 0, 9, 0, 0, 65, 65),
+    ("batch_003", EPIC): (83, 71, 36, 35, 0, 12, 0, 0, 71, 71),
+    ("batch_003", MEDITECH): (31, 27, 18, 9, 0, 4, 0, 0, 27, 27),
+}
+
+
+def fingerprint(folder: Path) -> dict[str, str]:
+    if not folder.exists():
+        return {}
+    return {str(p.relative_to(folder)): hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(folder.rglob("*")) if p.is_file()}
+
+
+def make_env(base: Path, data_dir: Path) -> dict[str, str]:
+    return {
+        "DATA_DIR": str(data_dir),
+        "REFERENCE_DIR": str(REFERENCE),
+        "OUTPUT_DIR": str(base / "output"),
+        "RAW_DB_PATH": str(base / "work" / "raw.duckdb"),
+        "SCHEMA_CONTRACT_PATH": str(CONTRACT_PATH),
+        "LOG_LEVEL": "WARNING",
+        "PATIENT_KEY_HMAC_SECRET": TEST_PATIENT_KEY_SECRET,
+    }
+
+
+def monthly_totals(con, as_of_batch: str | None = None) -> dict[tuple[int, int], tuple[int, Decimal]]:
+    """Encounters and billed total per admit month, excluding VOID: the brief's main reporting query.
+
+    as_of_batch=None reads clean.encounter_current. Otherwise the current
+    version is chosen among the versions known by the end of that batch.
+    """
+    if as_of_batch is None:
+        picked, params = (
+            "SELECT source_batch_id AS batch_id, source_file_name AS file_name, source_row_number "
+            "FROM clean.encounter_current"
+        ), []
+    else:
+        picked, params = (
+            "SELECT first_seen_batch_id AS batch_id, first_seen_file_name AS file_name, "
+            "       first_seen_source_row_number AS source_row_number "
+            "FROM clean.encounter_versions WHERE first_seen_batch_id <= ? "
+            "QUALIFY row_number() OVER (PARTITION BY encounter_key ORDER BY last_updated_ts_utc DESC, "
+            "first_seen_batch_id, first_seen_file_name, first_seen_source_row_number) = 1"
+        ), [as_of_batch]
+    rows = con.execute(
+        f"WITH picked AS ({picked}) "
+        "SELECT f.source_system, f.delivered_at, e.admit_date, e.billed_amount, e.claim_status "
+        "FROM picked p JOIN raw.encounters e USING (batch_id, file_name, source_row_number) "
+        "JOIN raw.ingested_files f USING (batch_id, file_name)",
+        params,
+    ).fetchall()
+    totals: dict[tuple[int, int], list] = defaultdict(lambda: [0, Decimal("0.00")])
+    for system, delivered_at, admit_text, amount_text, status_text in rows:
+        convention = CONVENTIONS[system]
+        admit = parse_date(
+            admit_text,
+            date_order=convention.date_order,
+            delivered_at=datetime.fromisoformat(delivered_at),
+            two_digit_year_century=convention.two_digit_year_century,
+        ).cleaned_value
+        if admit is None or parse_claim_status(status_text).cleaned_value == ClaimStatus.VOID:
+            continue
+        month = totals[(admit.year, admit.month)]
+        month[0] += 1
+        month[1] += parse_amount(amount_text, convention.amount_unit).cleaned_value or Decimal("0.00")
+    return {month: (count, total) for month, (count, total) in totals.items()}
+
+
+def late_update_months(con) -> set[tuple[int, int]]:
+    """Admit months of encounters that received a newer version in batch_003."""
+    rows = con.execute(
+        "SELECT f.source_system, f.delivered_at, e.admit_date "
+        "FROM clean.encounter_row_outcomes o "
+        "JOIN raw.encounters e USING (batch_id, file_name, source_row_number) "
+        "JOIN raw.ingested_files f USING (batch_id, file_name) "
+        "WHERE o.batch_id = 'batch_003' AND o.outcome = 'NEW_VERSION'"
+    ).fetchall()
+    months = set()
+    for system, delivered_at, admit_text in rows:
+        c = CONVENTIONS[system]
+        admit = parse_date(admit_text, date_order=c.date_order, delivered_at=datetime.fromisoformat(delivered_at),
+                           two_digit_year_century=c.two_digit_year_century).cleaned_value
+        if admit is not None:
+            months.add((admit.year, admit.month))
+    return months
+
+
+def read_audit_csv(env, *, drop_run_times: bool) -> list[dict]:
+    with (Path(env["OUTPUT_DIR"]) / "batch_audit.csv").open(encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    if drop_run_times:
+        rows = [{k: v for k, v in row.items() if k not in CSV_RUN_TIME_COLUMNS} for row in rows]
+    return rows
+
+
+def capture(env) -> dict:
+    db = Path(env["RAW_DB_PATH"])
+    con = attach(db)
+    try:
+        state = {
+            "audit": con.execute(f"SELECT {', '.join(AUDIT_COLUMNS)} FROM ops.batch_audit ORDER BY batch_id, file_name").fetchall(),
+            "counts": {t: con.execute(f"SELECT count(*) FROM {t}").fetchone()[0] for t in STATE_TABLES},
+            "current_totals": monthly_totals(con),
+            "asof_002_totals": monthly_totals(con, "batch_002"),
+            "late_update_months": late_update_months(con),
+        }
+    finally:
+        con.close()
+    state["digest"] = state_digest(db)
+    state["digest_all"] = state_digest(db, exclude_run_times=False)
+    state["csv"] = read_audit_csv(env, drop_run_times=True)
+    state["csv_bytes"] = (Path(env["OUTPUT_DIR"]) / "batch_audit.csv").read_bytes()
+    return state
+
+
+@pytest.fixture(scope="module")
+def runs(tmp_path_factory):
+    base = tmp_path_factory.mktemp("parity")
+    watched = {"data": REAL_DATA_DIR, "output": REPO_ROOT / "output", "work": REPO_ROOT / "work"}
+    before = {name: fingerprint(path) for name, path in watched.items()}
+    logger = logging.getLogger("pipeline")
+    handlers, level = logger.handlers[:], logger.level
+    states = {}
+    try:
+        incremental_data = base / "incremental" / "data"
+        (incremental_data / "landing").mkdir(parents=True)
+        incremental = make_env(base / "incremental", incremental_data)
+        for batch_id in BATCH_IDS:
+            shutil.copytree(LANDING / batch_id, incremental_data / "landing" / batch_id)
+            assert main(incremental) == 0, batch_id
+            states[batch_id] = capture(incremental)
+
+        assert main(incremental) == 0
+        states["rerun"] = capture(incremental)
+
+        one_shot = make_env(base / "one_shot", REAL_DATA_DIR)
+        assert main(one_shot) == 0
+        states["one_shot"] = capture(one_shot)
+
+        rebuild = make_env(base / "rebuild", REAL_DATA_DIR)
+        Path(rebuild["RAW_DB_PATH"]).parent.mkdir(parents=True)
+        shutil.copyfile(one_shot["RAW_DB_PATH"], rebuild["RAW_DB_PATH"])
+        make_pre_task4(Path(rebuild["RAW_DB_PATH"]))
+        states["pre_task4_refused"] = main(rebuild)
+        assert main(rebuild, ["--rebuild-derived"]) == 0
+        states["rebuild"] = capture(rebuild)
+
+        rebuild_live = make_env(base / "rebuild_live", incremental_data)
+        Path(rebuild_live["RAW_DB_PATH"]).parent.mkdir(parents=True)
+        shutil.copyfile(incremental["RAW_DB_PATH"], rebuild_live["RAW_DB_PATH"])
+        assert main(rebuild_live, ["--rebuild-derived"]) == 0
+        states["rebuild_live"] = capture(rebuild_live)
+    finally:
+        logger.handlers[:] = handlers
+        logger.setLevel(level)
+    states["watched_unchanged"] = {name: fingerprint(path) == before[name] for name, path in watched.items()}
+    return states
+
+
+# --- safety ---
+
+
+def test_real_data_output_and_work_are_untouched(runs):
+    assert runs["watched_unchanged"] == {"data": True, "output": True, "work": True}
+
+
+def test_only_operational_timestamps_are_excluded_from_comparison(runs):
+    for run in FINAL_RUNS:
+        for table, (compared, excluded, _, _) in runs[run]["digest"].items():
+            assert excluded == RUN_TIME_COLUMNS.get(table, ()), (run, table)
+            all_columns = runs[run]["digest_all"][table][0]
+            assert compared == tuple(c for c in all_columns if c not in excluded), (run, table)
+    assert set(runs["one_shot"]["csv"][0]) == set(AUDIT_COLUMNS) - set(CSV_RUN_TIME_COLUMNS)
+
+
+# --- parity ---
+
+
+@pytest.mark.parametrize("run", FINAL_RUNS[1:])
+def test_final_state_is_identical_to_the_incremental_run(runs, run):
+    reference = runs["batch_004"]
+    for table in STATE_TABLES:
+        assert runs[run]["digest"][table] == reference["digest"][table], (run, table)
+    assert runs[run]["csv"] == reference["csv"]
+    assert runs[run]["current_totals"] == reference["current_totals"]
+
+
+def test_a_pre_task4_database_is_refused_then_migrated_by_rebuild(runs):
+    assert runs["pre_task4_refused"] == 1
+    assert runs["rebuild"]["digest"] == runs["one_shot"]["digest"]
+
+
+# --- approved counts ---
+
+
+def test_approved_per_file_counts(runs):
+    columns = AUDIT_COLUMNS
+    counted = {}
+    for row in runs["batch_004"]["audit"]:
+        values = dict(zip(columns, row, strict=True))
+        if values["status"] == "ACCEPTED":
+            counted[(values["batch_id"], values["file_name"])] = (
+                values["received_count"], values["accepted_count"],
+                *(values[c] for c in TASK4_COLUMNS if c != "reconciliation_status"),
+            )
+            assert values["reconciliation_status"] == "RECONCILED"
+    assert counted == APPROVED_PER_FILE
+
+
+def test_approved_totals(runs):
+    state = runs["batch_004"]
+    audit = [dict(zip(AUDIT_COLUMNS, row, strict=True)) for row in state["audit"] if row[AUDIT_COLUMNS.index("status")] == "ACCEPTED"]
+
+    def total(column):
+        return sum(row[column] for row in audit)
+
+    assert total("new_encounter_count") == 3274
+    assert total("new_version_count") == 267
+    assert total("duplicate_count") == 70
+    assert total("stale_count") == 25
+    assert total("quarantined_count") == 0
+    assert total("history_rows_written") == state["counts"]["clean.encounter_versions"] == 3541
+    assert state["counts"]["clean.encounter_current"] == 3274
+    assert state["counts"]["clean.encounter_row_outcomes"] == state["counts"]["raw.encounters"] == 3636
+
+
+# --- batch_004 and idempotency ---
+
+
+def test_rejected_batch_004_changes_no_derived_state(runs):
+    after_003, after_004 = runs["batch_003"], runs["batch_004"]
+
+    for table in DERIVED_TABLES:
+        assert after_004["digest_all"][table] == after_003["digest_all"][table], table
+    assert after_004["current_totals"] == after_003["current_totals"]
+    new_rows = [row for row in after_004["audit"] if row not in after_003["audit"]]
+    assert after_004["audit"][: len(after_003["audit"])] == after_003["audit"]  # earlier rows untouched, timings too
+    assert len(new_rows) == 3
+    for row in new_rows:
+        values = dict(zip(AUDIT_COLUMNS, row, strict=True))
+        assert (values["batch_id"], values["status"]) == ("batch_004", "REJECTED")
+        assert all(values[c] is None for c in TASK4_COLUMNS), values["file_name"]
+
+
+def test_rerun_adds_and_changes_nothing(runs):
+    before, after = runs["batch_004"], runs["rerun"]
+
+    assert after["digest_all"] == before["digest_all"]  # every column, timings included
+    assert after["counts"] == before["counts"]
+    assert after["audit"] == before["audit"]
+    assert after["csv_bytes"] == before["csv_bytes"]
+
+
+# --- late arrivals ---
+
+
+def test_late_updates_change_historical_months_but_not_the_as_of_state(runs):
+    after_002, final = runs["batch_002"], runs["batch_004"]
+
+    # As of batch_002, read from the final history, is exactly what batch_002 left as current:
+    # later versions did not overwrite it.
+    assert final["asof_002_totals"] == after_002["current_totals"]
+    # The current state does differ in months that existed at batch_002 ...
+    changed = {
+        month for month, totals in after_002["current_totals"].items() if final["current_totals"].get(month) != totals
+    }
+    assert changed
+    # ... including months whose encounters got a newer version in batch_003 (late updates),
+    # all of them months that had already been reported.
+    late = final["late_update_months"]
+    assert late and late <= set(after_002["current_totals"])
+    assert changed & late
+    assert max(late) < (2025, 1)  # batch_003 was delivered 2025-01-20
