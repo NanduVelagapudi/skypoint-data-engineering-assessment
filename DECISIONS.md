@@ -679,6 +679,63 @@ All entries below were approved in design review. Counts are for batches
   - In production the same rules become a set-based query per batch and an
     insert-only `MERGE` on `version_key` (see ARCHITECTURE.md).
 
+## Task 5: warehouse model
+
+All entries below were approved in design review. Counts are for batches
+001–003.
+
+### Build strategy
+- **`clean.encounter_version_fields` is insert-only.** It holds the cleaned
+  Task 2 fields of each new version, with raw value, cleaned value and reason
+  side by side. It is written in the batch transaction, inside the same
+  per-batch step as the history, so each batch touches only its own new
+  versions.
+- **The `mart` tables are rebuilt deterministically on every run,** in one
+  transaction (`warehouse.rebuild_mart`): the five dimensions, both fact tables
+  and `dim_patient`.
+  - Why: some inputs change for rows that are already loaded. A new batch can
+    re-link a patient and change their `patient_key`, and a late version can
+    change which version is current. Rebuilding about 3,500 rows from the
+    clean layer is cheap, and the same inputs always give byte-identical
+    tables and CSVs.
+  - This repeats the documented `encounter_patients` trade-off against "each
+    batch updates only the records it touches".
+  - In production the mart would be updated with a `MERGE` over the touched
+    `encounter_key`s, plus a persistent `patient_key` crosswalk, instead of a
+    full rebuild.
+- **A change to the reference data or the facility aliases needs
+  `python -m pipeline.main --rebuild-derived`.** The insert-only version
+  fields were cleaned with the reference data and aliases of their day: a
+  changed alias would otherwise apply only to new versions. The rebuild clears
+  and refills the fields table with the same step. A normal run refuses a
+  database whose versions lack fields.
+
+### Dimensions
+- **A provider missing from the roster gets no fallback.** `provider_sk` and
+  every provider attribute are NULL, and `provider_sk_reason` says why, checked
+  in this order:
+  1. the NPI is invalid: the NPI's own reason (20 current versions);
+  2. the valid NPI is in no snapshot: `NPI_NOT_IN_ROSTER` (18);
+  3. the admit date is unknown: `PROVIDER_ADMIT_DATE_UNKNOWN` (18);
+  4. no row covers the admit date: `PROVIDER_NOT_ON_ROSTER_AT_ADMIT` (0).
+
+  The latest snapshot is never used in place of the point-in-time one. For 336
+  current encounters, the two give a different employment status.
+- **Only the earliest snapshot applies backwards,** read literally. Its rows
+  are valid from `0001-01-01`. A provider who first appears in a later snapshot
+  has no row before that date, and a provider dropped from a snapshot has none
+  after it. `valid_to` is exclusive. Every roster attribute is tracked,
+  provider names included, which gives 65 rows for 54 NPIs.
+- **`dim_date` covers the full calendar years spanned by the cleaned admit and
+  discharge dates:** 2023-01-01 to 2025-12-31, 1,096 days. The range comes from
+  the data, so a later batch with 2026 dates extends it rather than falling
+  outside it.
+- **In `dim_diagnosis`, `is_chronic` NULL means unknown, not "N".** Valid
+  ICD-10 codes seen in the data but missing from the reference (3 codes) are
+  added with `in_reference = false`, and with NULL description, category and
+  `is_chronic`. The reference does not say whether they are chronic, so a
+  chronic filter (Task 7) excludes them rather than counting them as acute.
+
 ## Approved for later groups (not implemented yet)
 
 - **The Docker container runs as root**, with no `USER` directive. A

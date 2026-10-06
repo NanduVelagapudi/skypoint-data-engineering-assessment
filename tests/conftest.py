@@ -12,10 +12,18 @@ import hashlib
 import io
 import json
 import logging
+from collections import defaultdict
 from dataclasses import dataclass
+from datetime import datetime
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
+
+from pipeline.parsers.amount import parse_amount
+from pipeline.parsers.categorical import ClaimStatus, parse_claim_status
+from pipeline.parsers.dates import parse_date
+from pipeline.source_conventions import load_source_conventions
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CONTRACT_PATH = REPO_ROOT / "config" / "schema_contracts.json"
@@ -261,3 +269,53 @@ def state_digest(db_path: Path, *, exclude_run_times: bool = True) -> dict[str, 
         return digest
     finally:
         con.close()
+
+
+# --- independent monthly totals (checks the mart's reporting queries) ---
+
+
+def independent_monthly_totals(con, as_of_batch: str | None = None) -> dict[tuple[int, int], tuple[int, Decimal]]:
+    """Encounters and billed total per admit month, excluding VOID, computed independently of the mart.
+
+    It re-parses the raw admit date, amount and claim status of each current version with the Task 2
+    parsers, so the mart queries (README queries 1 and 5) can be checked against it.
+
+    as_of_batch=None reads clean.encounter_current. Otherwise the current
+    version is chosen among the versions known by the end of that batch.
+    """
+    if as_of_batch is None:
+        picked, params = (
+            "SELECT source_batch_id AS batch_id, source_file_name AS file_name, source_row_number "
+            "FROM clean.encounter_current"
+        ), []
+    else:
+        picked, params = (
+            "SELECT first_seen_batch_id AS batch_id, first_seen_file_name AS file_name, "
+            "       first_seen_source_row_number AS source_row_number "
+            "FROM clean.encounter_versions WHERE first_seen_batch_id <= ? "
+            "QUALIFY row_number() OVER (PARTITION BY encounter_key ORDER BY last_updated_ts_utc DESC, "
+            "first_seen_batch_id, first_seen_file_name, first_seen_source_row_number) = 1"
+        ), [as_of_batch]
+    rows = con.execute(
+        f"WITH picked AS ({picked}) "
+        "SELECT f.source_system, f.delivered_at, e.admit_date, e.billed_amount, e.claim_status "
+        "FROM picked p JOIN raw.encounters e USING (batch_id, file_name, source_row_number) "
+        "JOIN raw.ingested_files f USING (batch_id, file_name)",
+        params,
+    ).fetchall()
+    conventions = load_source_conventions(REAL_DATA_DIR / "reference" / "source_systems_and_facilities.json")
+    totals: dict[tuple[int, int], list] = defaultdict(lambda: [0, Decimal("0.00")])
+    for system, delivered_at, admit_text, amount_text, status_text in rows:
+        convention = conventions[system]
+        admit = parse_date(
+            admit_text,
+            date_order=convention.date_order,
+            delivered_at=datetime.fromisoformat(delivered_at),
+            two_digit_year_century=convention.two_digit_year_century,
+        ).cleaned_value
+        if admit is None or parse_claim_status(status_text).cleaned_value == ClaimStatus.VOID:
+            continue
+        month = totals[(admit.year, admit.month)]
+        month[0] += 1
+        month[1] += parse_amount(amount_text, convention.amount_unit).cleaned_value or Decimal("0.00")
+    return {month: (count, total) for month, (count, total) in totals.items()}

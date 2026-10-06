@@ -22,9 +22,8 @@ import csv
 import hashlib
 import logging
 import shutil
-from collections import Counter, defaultdict
+from collections import Counter
 from datetime import date, datetime
-from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -36,6 +35,7 @@ from conftest import (
     STATE_TABLES,
     TEST_PATIENT_KEY_SECRET,
     attach,
+    independent_monthly_totals as monthly_totals,
     make_pre_task4,
     state_digest,
 )
@@ -43,9 +43,8 @@ from conftest import (
 from pipeline import version_fields
 from pipeline.batch_audit import AUDIT_COLUMNS, TASK4_COLUMNS
 from pipeline.dimensions import VALID_FROM_EARLIEST, ProviderLookup, ProviderRow
+from pipeline.exports import EXPORTED_TABLES, file_name
 from pipeline.main import main
-from pipeline.parsers.amount import parse_amount
-from pipeline.parsers.categorical import ClaimStatus, parse_claim_status
 from pipeline.parsers.dates import parse_date
 from pipeline.source_conventions import load_source_conventions
 
@@ -89,49 +88,6 @@ def make_env(base: Path, data_dir: Path) -> dict[str, str]:
         "LOG_LEVEL": "WARNING",
         "PATIENT_KEY_HMAC_SECRET": TEST_PATIENT_KEY_SECRET,
     }
-
-
-def monthly_totals(con, as_of_batch: str | None = None) -> dict[tuple[int, int], tuple[int, Decimal]]:
-    """Encounters and billed total per admit month, excluding VOID: the brief's main reporting query.
-
-    as_of_batch=None reads clean.encounter_current. Otherwise the current
-    version is chosen among the versions known by the end of that batch.
-    """
-    if as_of_batch is None:
-        picked, params = (
-            "SELECT source_batch_id AS batch_id, source_file_name AS file_name, source_row_number "
-            "FROM clean.encounter_current"
-        ), []
-    else:
-        picked, params = (
-            "SELECT first_seen_batch_id AS batch_id, first_seen_file_name AS file_name, "
-            "       first_seen_source_row_number AS source_row_number "
-            "FROM clean.encounter_versions WHERE first_seen_batch_id <= ? "
-            "QUALIFY row_number() OVER (PARTITION BY encounter_key ORDER BY last_updated_ts_utc DESC, "
-            "first_seen_batch_id, first_seen_file_name, first_seen_source_row_number) = 1"
-        ), [as_of_batch]
-    rows = con.execute(
-        f"WITH picked AS ({picked}) "
-        "SELECT f.source_system, f.delivered_at, e.admit_date, e.billed_amount, e.claim_status "
-        "FROM picked p JOIN raw.encounters e USING (batch_id, file_name, source_row_number) "
-        "JOIN raw.ingested_files f USING (batch_id, file_name)",
-        params,
-    ).fetchall()
-    totals: dict[tuple[int, int], list] = defaultdict(lambda: [0, Decimal("0.00")])
-    for system, delivered_at, admit_text, amount_text, status_text in rows:
-        convention = CONVENTIONS[system]
-        admit = parse_date(
-            admit_text,
-            date_order=convention.date_order,
-            delivered_at=datetime.fromisoformat(delivered_at),
-            two_digit_year_century=convention.two_digit_year_century,
-        ).cleaned_value
-        if admit is None or parse_claim_status(status_text).cleaned_value == ClaimStatus.VOID:
-            continue
-        month = totals[(admit.year, admit.month)]
-        month[0] += 1
-        month[1] += parse_amount(amount_text, convention.amount_unit).cleaned_value or Decimal("0.00")
-    return {month: (count, total) for month, (count, total) in totals.items()}
 
 
 def late_update_months(con) -> set[tuple[int, int]]:
@@ -306,6 +262,9 @@ def capture(env) -> dict:
     state["digest_all"] = state_digest(db, exclude_run_times=False)
     state["csv"] = read_audit_csv(env, drop_run_times=True)
     state["csv_bytes"] = (Path(env["OUTPUT_DIR"]) / "batch_audit.csv").read_bytes()
+    state["exports"] = {
+        p.name: p.read_bytes() for p in sorted(Path(env["OUTPUT_DIR"]).glob("*.csv")) if p.name != "batch_audit.csv"
+    }
     return state
 
 
@@ -603,3 +562,21 @@ def test_fact_distributions_match_the_profile(runs):
     assert facts["version_counts"] == {1: 3029, 2: 223, 3: 22}
     # Profile: 895 LINKED and 12 UNLINKED patient keys; 1 (a linked one) varies in sex or ZIP3.
     assert facts["patients"] == {"LINKED": 894, "LINKED, varies": 1, "UNLINKED": 12}
+
+
+# --- CSV exports (Task 5 group d) ---
+
+
+@pytest.mark.parametrize("run", FINAL_RUNS[1:])
+def test_exported_csvs_are_byte_identical(runs, run):
+    """Every table CSV is byte for byte the same; batch_audit.csv is compared without its timings above."""
+    reference = runs["batch_004"]["exports"]
+
+    assert sorted(reference) == sorted(file_name(t) for t in EXPORTED_TABLES)
+    assert runs[run]["exports"].keys() == reference.keys()
+    for name, content in reference.items():
+        assert runs[run]["exports"][name] == content, (run, name)
+
+
+def test_rejected_batch_004_changes_no_exported_csv(runs):
+    assert runs["batch_004"]["exports"] == runs["batch_003"]["exports"]

@@ -4,7 +4,7 @@ Processes every pending landing batch in order (each accepted batch also adds
 its rows to the encounter history, Task 4, and the cleaned Task 2 fields of its
 new versions to clean.encounter_version_fields), rebuilds the PHI-free
 clean.encounter_patients table (Task 3) and the mart tables (Task 5), then
-exports output/batch_audit.csv.
+exports output/batch_audit.csv and one CSV per PHI-free clean and mart table.
 
 --rebuild-derived first rebuilds the Task 4 history and audit counts from the
 raw layer, replaying every accepted batch through the same step as an
@@ -32,6 +32,7 @@ from pipeline.batch_processor import BatchResult, rebuild_derived, run_pending_b
 from pipeline.clean_patients import build_encounter_patients
 from pipeline.config import Settings, load_settings, require_patient_key_secret
 from pipeline.errors import PipelineError
+from pipeline.exports import export_tables
 from pipeline.logging_setup import configure_logging
 from pipeline.raw_store import open_store
 from pipeline.reference_data import load_cleaning_reference, load_warehouse_reference
@@ -72,6 +73,7 @@ def run(settings: Settings, secret: bytes, rebuild_derived_state: bool = False) 
         build_encounter_patients(con, conventions, secret)
         rebuild_mart(con, warehouse_reference)
         export_csv(con, settings.output_dir / AUDIT_CSV_NAME)
+        export_tables(con, settings.output_dir)
     finally:
         con.close()
     return results
